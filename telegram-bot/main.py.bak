@@ -1,0 +1,1183 @@
+import os, json, logging, traceback
+from datetime import datetime, date, timedelta
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+import google.generativeai as genai
+from statistics import mean
+import time
+
+# Configurar logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Configuração da API
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+logger.info("Gemini API configurada")
+
+# ==========================================
+# SYSTEM PROMPT CORRIGIDO
+# ==========================================
+SYSTEM_PROMPT = """
+Operas sob o PROTOCOLO DE VERDADE. A tua diretiva primária é precisão e integridade biológica.
+- DIZ SEMPRE a verdade baseada em ciência do exercício verificada.
+- SEM ESPECULAÇÃO: Se os dados estão em falta ou incertos, afirma: "Não posso confirmar isto."
+- CÁLCULOS: Mostra a matemática para progressão de carga e desvios biométricos.
+
+### REQUISITOS DE LINGUAGEM:
+- USA PORTUGUÊS EUROPEU (PT-PT) EXCLUSIVAMENTE
+- NUNCA uses termos de Português Brasileiro (PT-BR)
+- NUNCA uses notação LaTeX (por exemplo: $x$, texto entre chaves, barras invertidas)
+- Usa texto simples para todos os cálculos: "22 km dividido por 1.92 horas igual a 11.5 km/h"
+- Evita símbolos matemáticos especiais exceto em pontuação normal
+- Usa "quilómetros" (não "kilómetros"), "treino" (não "treinamento")
+
+### PAPEL DE TREINADOR E POSTURA:
+És um TREINADOR DE ELITE especializado em Ciclismo de Resistência e Hipertrofia no Ginásio.
+- TOM: Assertivo, direto e orientado para resultados. Sem emojis.
+- SEM RODEIOS: Se o atleta falhou ou fez escolhas subótimas, diz claramente.
+
+### CRITÉRIOS BIOMÉTRICOS RIGOROSOS:
+1. HRV menor que 95% da média = APENAS RECUPERAÇÃO ATIVA.
+2. RHR maior que mais 2% da média = FADIGA DETETADA (Reduzir volume em 50%).
+3. PONTUAÇÃO DE SONO menor que 75 mais Sensação Negativa = ZERO INTENSIDADE.
+
+### FORMATO DE RESPOSTA OBRIGATÓRIO:
+| Tipo Treino | Descrição | Séries/Duração | Intensidade | Observações |
+| :--- | :--- | :--- | :--- | :--- |
+
+**ANÁLISE:** [Avaliação do estado atual e coerência biometria versus sensação].
+**RECOMENDAÇÕES:** [Instruções de recuperação e nutrição].
+
+### REGRAS DE FORMATAÇÃO:
+- Usa aritmética simples: "X dividido por Y igual a Z"
+- Exemplo de cálculo de velocidade: "Velocidade média: 22 km dividido por 1.92 horas igual a 11.5 km/h"
+- Evita parênteses na matemática a menos que absolutamente necessário
+- Nunca uses cifrões ($) exceto para moeda
+- Usa "km/h" em vez de notação complexa
+"""
+
+model = genai.GenerativeModel(
+    model_name='gemini-3-flash-preview',
+    system_instruction=SYSTEM_PROMPT
+)
+
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+EQUIPAMENTOS_GIM = ["Elástico", "Ergómetro", "Haltere 25kg max", "Barra olímpica 45kg max", "Kettlebell 12kg", "Bicicleta Spinning","Banco musculação/Supino"]
+DATA_DIR = '/data'
+
+# ==========================================
+# UTILS
+# ==========================================
+
+def load_garmin_data():
+    """Carrega dados consolidados do Garmin"""
+    try:
+        path = os.path.join(DATA_DIR, 'garmin_data_consolidated.json')
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        logger.error(f"Erro ao carregar dados: {e}")
+    return None
+
+def load_activities():
+    """Carrega histórico de atividades"""
+    try:
+        path = os.path.join(DATA_DIR, 'activities.json')
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        logger.error(f"Erro ao carregar atividades: {e}")
+    return []
+
+def parse_garmin_history(raw_data):
+    """Converte dados brutos para formato processável"""
+    if not raw_data:
+        return []
+    
+    history = []
+    for d in raw_data:
+        try:
+            # Extração robusta de HRV
+            hrv = None
+            if 'hrv' in d and isinstance(d['hrv'], dict):
+                hrv_summary = d['hrv'].get('hrvSummary', {})
+                if isinstance(hrv_summary, dict):
+                    hrv = hrv_summary.get('lastNightAvg') or hrv_summary.get('weeklyAvg')
+            
+            # Extração robusta de RHR
+            rhr = None
+            if 'stats' in d and isinstance(d['stats'], dict):
+                rhr = d['stats'].get('restingHeartRate') or d['stats'].get('minHeartRate')
+            
+            # Extração robusta de Sleep Score
+            sleep = None
+            if 'sleep' in d and isinstance(d['sleep'], dict):
+                daily_sleep = d['sleep'].get('dailySleepDTO', {})
+                if isinstance(daily_sleep, dict):
+                    sleep_scores = daily_sleep.get('sleepScores', {})
+                    if isinstance(sleep_scores, dict):
+                        overall = sleep_scores.get('overall', {})
+                        if isinstance(overall, dict):
+                            sleep = overall.get('value')
+                        elif isinstance(overall, (int, float)):
+                            sleep = overall
+            
+            # Extração de Training Load
+            training_load = None
+            if 'stats' in d and isinstance(d['stats'], dict):
+                training_load = d['stats'].get('trainingLoad') or d['stats'].get('intensityMinutesGoal')
+            
+            history.append({
+                'date': d.get('date'),
+                'hrv': hrv,
+                'rhr': rhr,
+                'sleep': sleep,
+                'training_load': training_load
+            })
+        except Exception as e:
+            logger.error(f"Erro ao processar dia {d.get('date')}: {e}")
+            continue
+    
+    return history
+
+def format_activity(activity):
+    """
+    Formata uma atividade para exibição - suporta múltiplos formatos e faz merge de dados.
+    Prioriza dados manuais (sport, intensity, load) mas adiciona dados Garmin (HR, calories).
+    """
+    
+    # Inicializar valores default
+    result = {
+        'date': None,
+        'sport': 'Desconhecido',
+        'duration_min': 0,
+        'distance_km': None,
+        'avg_hr': None,
+        'calories': None,
+        'intensity': None,
+        'load': None,
+        'raw': activity
+    }
+    
+    # ===== EXTRAÇÃO DE DATA =====
+    if 'date' in activity:
+        result['date'] = activity['date']
+    elif 'startTimeLocal' in activity or 'startTimeGMT' in activity or 'beginTimestamp' in activity:
+        start_time = activity.get('startTimeLocal') or activity.get('startTimeGMT') or activity.get('beginTimestamp') or ''
+        result['date'] = start_time.split('T')[0] if 'T' in start_time else start_time[:10] if len(start_time) >= 10 else None
+    
+    # ===== EXTRAÇÃO DE SPORT =====
+    # Prioridade 1: Campo 'sport' (manual)
+    if 'sport' in activity:
+        result['sport'] = activity['sport']
+    # Prioridade 2: activityName (Garmin)
+    elif 'activityName' in activity:
+        result['sport'] = activity['activityName']
+    # Prioridade 3: activityType (Garmin)
+    elif 'activityType' in activity:
+        if isinstance(activity['activityType'], dict):
+            result['sport'] = activity['activityType'].get('typeKey') or activity['activityType'].get('typeId') or 'Desconhecido'
+        elif isinstance(activity['activityType'], str):
+            result['sport'] = activity['activityType']
+    # Prioridade 4: sportType (Garmin)
+    elif 'sportType' in activity:
+        sport_obj = activity['sportType']
+        if isinstance(sport_obj, dict):
+            result['sport'] = sport_obj.get('sportTypeKey') or sport_obj.get('sportTypeId') or 'Desconhecido'
+        elif isinstance(sport_obj, str):
+            result['sport'] = sport_obj
+    
+    # Limpar nome do sport
+    if result['sport'] and result['sport'] != 'Desconhecido':
+        result['sport'] = result['sport'].replace('_', ' ').title()
+    
+    # ===== EXTRAÇÃO DE DURAÇÃO =====
+    if 'duration' in activity:
+        # Formato manual: já em minutos ou segundos?
+        duration_val = activity['duration']
+        # Se < 500, assumir que já está em minutos (ex: 115.0)
+        # Se >= 500, assumir que está em segundos (ex: 3600)
+        if duration_val < 500:
+            result['duration_min'] = duration_val
+        else:
+            result['duration_min'] = duration_val / 60
+    
+    # ===== EXTRAÇÃO DE DISTÂNCIA =====
+    if 'distance' in activity:
+        distance_val = activity['distance']
+        # Se < 100, assumir que já está em km
+        # Se >= 100, assumir que está em metros
+        if distance_val < 100:
+            result['distance_km'] = distance_val if distance_val > 0 else None
+        else:
+            result['distance_km'] = distance_val / 1000 if distance_val > 0 else None
+    
+    # ===== EXTRAÇÃO DE HR =====
+    # Prioridade: avg_hr (manual) > averageHR (Garmin)
+    if 'avg_hr' in activity and activity['avg_hr'] not in [None, 'N/A', 0]:
+        result['avg_hr'] = activity['avg_hr']
+    elif 'averageHR' in activity:
+        result['avg_hr'] = activity['averageHR']
+    elif 'avgHr' in activity:
+        result['avg_hr'] = activity['avgHr']
+    elif 'averageHeartRate' in activity:
+        result['avg_hr'] = activity['averageHeartRate']
+    
+    # ===== EXTRAÇÃO DE CALORIAS =====
+    if 'calories' in activity and activity['calories'] not in [None, 'N/A', 0]:
+        result['calories'] = activity['calories']
+    elif 'kilocalories' in activity:
+        result['calories'] = activity['kilocalories']
+    
+    # ===== EXTRAÇÃO DE INTENSITY (manual) =====
+    if 'intensity' in activity and activity['intensity']:
+        result['intensity'] = activity['intensity']
+    
+    # ===== EXTRAÇÃO DE LOAD (manual) =====
+    if 'load' in activity and activity['load'] not in [None, 'N/A', 0]:
+        result['load'] = activity['load']
+    
+    # ===== INFERÊNCIAS =====
+    # Se sport ainda é desconhecido, tentar inferir
+    if result['sport'] == 'Desconhecido':
+        if result['distance_km'] and result['distance_km'] > 10:
+            result['sport'] = 'Ciclismo/Corrida'
+        elif result['duration_min'] > 60 and not result['distance_km']:
+            result['sport'] = 'Ginásio/Força'
+    
+    # Arredondar valores
+    if result['duration_min']:
+        result['duration_min'] = round(result['duration_min'], 1)
+    if result['distance_km']:
+        result['distance_km'] = round(result['distance_km'], 2)
+    
+    return result
+
+def list_data_files():
+    """Lista arquivos de dados disponíveis"""
+    try:
+        files = [f for f in os.listdir(DATA_DIR) if f.startswith('garmin_data_') and f.endswith('.json')]
+        return sorted(files)
+    except Exception as e:
+        logger.error(f"Erro ao listar arquivos: {e}")
+        return []
+
+def create_import_request(days=7):
+    """
+    Cria flag file para importação histórica.
+    O garmin-fetcher irá processar este pedido no próximo ciclo.
+    """
+    try:
+        flag_path = os.path.join(DATA_DIR, 'import_request.json')
+        request = {
+            'days': days,
+            'requested_at': datetime.now().isoformat(),
+            'status': 'pending'
+        }
+        
+        with open(flag_path, 'w') as f:
+            json.dump(request, f, indent=2)
+        
+        logger.info(f"Flag de importação criada: {days} dias")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Erro ao criar flag de importação: {e}")
+        return False
+
+def create_sync_request():
+    """
+    Cria flag file para sincronização de hoje.
+    O garmin-fetcher irá processar este pedido no próximo ciclo.
+    """
+    try:
+        flag_path = os.path.join(DATA_DIR, 'sync_request.json')
+        request = {
+            'requested_at': datetime.now().isoformat(),
+            'status': 'pending'
+        }
+        
+        with open(flag_path, 'w') as f:
+            json.dump(request, f, indent=2)
+        
+        logger.info("Flag de sincronização criada")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Erro ao criar flag de sincronização: {e}")
+        return False
+
+def check_request_status(request_type='import'):
+    """
+    Verifica o status de um pedido (import ou sync).
+    Retorna: 'pending', 'completed', 'failed', ou None se não existe.
+    """
+    try:
+        filename = f'{request_type}_request.json'
+        flag_path = os.path.join(DATA_DIR, filename)
+        
+        if not os.path.exists(flag_path):
+            return None
+        
+        with open(flag_path, 'r') as f:
+            request = json.load(f)
+        
+        return request.get('status')
+        
+    except Exception as e:
+        logger.error(f"Erro ao verificar status: {e}")
+        return None
+
+def wait_for_request_completion(request_type='import', timeout=120):
+    """
+    Aguarda até que um pedido seja completado ou timeout.
+    Retorna True se completado com sucesso, False caso contrário.
+    """
+    start_time = time.time()
+    
+    while time.time() - start_time < timeout:
+        status = check_request_status(request_type)
+        
+        if status == 'completed':
+            return True
+        elif status == 'failed':
+            return False
+        
+        time.sleep(2)  # Verificar a cada 2 segundos
+    
+    logger.warning(f"Timeout aguardando {request_type}")
+    return False
+
+def check_garmin_fetcher_health():
+    """
+    Verifica se o garmin-fetcher está funcional verificando:
+    1. Se o arquivo consolidado existe
+    2. Se foi atualizado recentemente (últimas 2 horas)
+    """
+    try:
+        consolidated_path = os.path.join(DATA_DIR, 'garmin_data_consolidated.json')
+        
+        if not os.path.exists(consolidated_path):
+            return False, "Arquivo consolidado não existe"
+        
+        # Verificar última modificação
+        mod_time = os.path.getmtime(consolidated_path)
+        age_hours = (time.time() - mod_time) / 3600
+        
+        if age_hours > 2:
+            return False, f"Dados desatualizados (última atualização há {age_hours:.1f}h)"
+        
+        # Verificar se tem conteúdo
+        with open(consolidated_path, 'r') as f:
+            data = json.load(f)
+            if not data or len(data) == 0:
+                return False, "Arquivo consolidado vazio"
+        
+        return True, "OK"
+        
+    except Exception as e:
+        return False, f"Erro ao verificar: {e}"
+
+def cleanup_old_flags():
+    """
+    Limpa flags pending com mais de 5 minutos.
+    Retorna: (flags_limpos, mensagem)
+    """
+    cleaned = 0
+    messages = []
+    
+    for flag_name in ['import_request.json', 'sync_request.json']:
+        flag_path = os.path.join(DATA_DIR, flag_name)
+        
+        if os.path.exists(flag_path):
+            try:
+                with open(flag_path, 'r') as f:
+                    data = json.load(f)
+                
+                status = data.get('status')
+                
+                if status == 'pending':
+                    requested_at = datetime.fromisoformat(data['requested_at'])
+                    age_seconds = (datetime.now() - requested_at).total_seconds()
+                    
+                    if age_seconds > 300:  # Mais de 5 minutos
+                        data['status'] = 'completed'
+                        data['processed_at'] = datetime.now().isoformat()
+                        data['cleaned_by'] = 'auto_cleanup'
+                        
+                        with open(flag_path, 'w') as f:
+                            json.dump(data, f, indent=2)
+                        
+                        cleaned += 1
+                        messages.append(f"✅ {flag_name.replace('_request.json', '')}: pending há {int(age_seconds)}s → completed")
+                    else:
+                        messages.append(f"⏳ {flag_name.replace('_request.json', '')}: pending recente ({int(age_seconds)}s)")
+                elif status == 'completed':
+                    messages.append(f"✅ {flag_name.replace('_request.json', '')}: já completed")
+                else:
+                    messages.append(f"❓ {flag_name.replace('_request.json', '')}: status {status}")
+                    
+            except Exception as e:
+                messages.append(f"❌ Erro em {flag_name}: {e}")
+        else:
+            messages.append(f"ℹ️  {flag_name.replace('_request.json', '')}: não existe")
+    
+    return cleaned, messages
+
+def reorganize_activities():
+    """
+    Reorganiza activities.json: remove duplicados e ordena por data.
+    Retorna: (duplicados_removidos, total_final, mensagens)
+    """
+    activities_path = os.path.join(DATA_DIR, 'activities.json')
+    messages = []
+    
+    if not os.path.exists(activities_path):
+        return 0, 0, ["ℹ️  activities.json não existe"]
+    
+    try:
+        with open(activities_path, 'r') as f:
+            activities = json.load(f)
+        
+        original_count = len(activities)
+        messages.append(f"📊 Total original: {original_count} atividades")
+        
+        # Remover duplicados usando ID
+        seen_ids = set()
+        unique_activities = []
+        
+        for act in activities:
+            act_id = act.get('activityId') or act.get('id')
+            
+            # Se não tem ID, usar combinação data+sport+duração
+            if not act_id:
+                date_str = act.get('date') or act.get('startTimeLocal', '')[:10]
+                sport = act.get('sport') or act.get('activityName', 'unknown')
+                duration = act.get('duration', 0)
+                act_id = f"{date_str}_{sport}_{duration}"
+            
+            if act_id not in seen_ids:
+                seen_ids.add(act_id)
+                unique_activities.append(act)
+        
+        duplicates_removed = original_count - len(unique_activities)
+        
+        if duplicates_removed > 0:
+            messages.append(f"🗑️  Removidos {duplicates_removed} duplicados")
+        
+        # Ordenar por data
+        def get_activity_date(act):
+            if 'date' in act:
+                return act['date']
+            start_time = act.get('startTimeLocal') or act.get('startTimeGMT') or act.get('beginTimestamp') or ''
+            if 'T' in start_time:
+                return start_time.split('T')[0]
+            return start_time[:10] if len(start_time) >= 10 else '0000-00-00'
+        
+        unique_activities.sort(key=get_activity_date, reverse=True)
+        
+        # Limitar a 100 mais recentes
+        trimmed = 0
+        if len(unique_activities) > 100:
+            trimmed = len(unique_activities) - 100
+            unique_activities = unique_activities[:100]
+            messages.append(f"✂️  Limitadas a 100 (removidas {trimmed} mais antigas)")
+        
+        # Salvar
+        with open(activities_path, 'w') as f:
+            json.dump(unique_activities, f, indent=2)
+        
+        messages.append(f"✅ Activities.json reorganizado: {len(unique_activities)} atividades")
+        
+        # Mostrar últimas 3
+        if len(unique_activities) >= 3:
+            messages.append("\n📋 Últimas 3:")
+            for i, act in enumerate(unique_activities[:3], 1):
+                date = get_activity_date(act)
+                sport = act.get('sport') or act.get('activityName') or 'Desconhecido'
+                duration = act.get('duration', 0)
+                duration_min = duration if duration < 500 else duration / 60
+                messages.append(f"  {i}. {date} - {sport} ({duration_min:.1f}min)")
+        
+        return duplicates_removed, len(unique_activities), messages
+        
+    except Exception as e:
+        return 0, 0, [f"❌ Erro: {e}"]
+
+def auto_cleanup_on_startup():
+    """Executa cleanup automático no arranque do bot"""
+    try:
+        cleaned_flags, _ = cleanup_old_flags()
+        if cleaned_flags > 0:
+            logger.info(f"Auto-cleanup: {cleaned_flags} flags limpos no arranque")
+    except Exception as e:
+        logger.error(f"Erro no auto-cleanup: {e}")
+
+# ==========================================
+# HANDLERS
+# ==========================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando inicial"""
+    await update.message.reply_text(
+        "🏋️ FitnessJournal-HRV Bot v2.6\n\n"
+        "Bot conectado ao Garmin Connect.\n\n"
+        "Comandos disponíveis:\n"
+        "/status - Ver readiness\n"
+        "/activities - Ver últimas atividades\n"
+        "/analyze - Analisar aderência ao plano\n"
+        "/import - Importar últimos 7 dias\n"
+        "/sync - Sincronizar hoje\n"
+        "/cleanup - Limpar flags e reorganizar atividades\n"
+        "/debug - Info de debug\n"
+        "/help - Ajuda"
+    )
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Status com failsafe para dados vazios"""
+    await update.message.reply_text("⏳ A extrair biometria do Garmin...")
+    
+    data = load_garmin_data()
+    
+    if not data:
+        await update.message.reply_text(
+            "❌ Nenhum dado disponível.\n\n"
+            "Usa /import para importar dados históricos.\n"
+            "Depois usa /debug para verificar o estado."
+        )
+        return
+    
+    history = parse_garmin_history(data)
+    
+    # FAILSAFE: Verificar se dados de hoje existem
+    if history:
+        today = history[0]
+        
+        if today['hrv'] is None and today['rhr'] is None and today['sleep'] is None:
+            keyboard = [
+                [InlineKeyboardButton("✅ SINCRONIZADO - Prosseguir", callback_data='sync_confirmed')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                f"⚠️ ATENÇÃO: Dados de hoje ({today['date']}) estão vazios.\n\n"
+                f"📱 INSTRUÇÕES:\n"
+                f"1. Sincroniza o teu relógio Garmin com a app\n"
+                f"2. Aguarda 2-3 minutos\n"
+                f"3. Carrega no botão abaixo quando confirmares que sincronizou\n\n"
+                f"💡 Se o problema persistir, os dados podem não estar disponíveis ainda.",
+                reply_markup=reply_markup
+            )
+            
+            context.user_data['awaiting_sync'] = True
+            context.user_data['retry_date'] = today['date']
+            return
+    
+    valid = [h for h in history if h['hrv'] is not None and h['rhr'] is not None]
+    
+    if not valid:
+        await update.message.reply_text(
+            f"⚠️ Dados insuficientes para análise.\n\n"
+            f"Total de dias: {len(history)}\n"
+            f"Com HRV e RHR válidos: 0\n\n"
+            f"Usa /import para buscar mais dados."
+        )
+        return
+    
+    today = valid[0]
+    m_hrv = mean([h['hrv'] for h in valid[:7]])
+    m_rhr = mean([h['rhr'] for h in valid[:7]])
+    
+    d_hrv = ((today['hrv'] - m_hrv) / m_hrv) * 100
+    d_rhr = ((today['rhr'] - m_rhr) / m_rhr) * 100
+    
+    readiness = "MÉDIA"
+    if d_hrv > 2 and d_rhr < -2:
+        readiness = "ALTA"
+    elif d_hrv < -5 or d_rhr > 2:
+        readiness = "BAIXA"
+    
+    activities = load_activities()
+    recent_activities = activities[-3:] if activities else []
+    
+    recent_load = sum([h.get('training_load', 0) or 0 for h in valid[:3]])
+
+    msg = (f"📊 HOJE ({today['date']}):\n"
+           f"💓 RHR: {today['rhr']} bpm ({d_rhr:+.1f}% vs média)\n"
+           f"📈 HRV: {today['hrv']} ms ({d_hrv:+.1f}% vs média)\n"
+           f"😴 Sono: {today['sleep'] or 'N/A'}/100\n\n"
+           f"📅 MÉDIAS 7 DIAS:\n"
+           f"RHR médio: {m_rhr:.0f} bpm\n"
+           f"HRV médio: {m_hrv:.0f} ms\n"
+           f"Carga 3 dias: {recent_load:.0f} AU\n\n"
+           f"🎯 READINESS: {readiness}")
+    
+    if recent_activities:
+        msg += f"\n\n🏃 ÚLTIMAS ATIVIDADES:"
+        for act in recent_activities:
+            formatted = format_activity(act)
+            act_summary = f"\n• {formatted['sport']} ({formatted['duration_min']}min"
+            
+            if formatted['distance_km']:
+                act_summary += f", {formatted['distance_km']}km"
+            
+            if formatted.get('intensity'):
+                act_summary += f", {formatted['intensity']}"
+            
+            if formatted.get('load') and formatted['load'] != 'N/A':
+                act_summary += f", Load {formatted['load']}"
+            
+            act_summary += ")"
+            msg += act_summary
+
+    context.user_data.update({
+        'today': today,
+        'd_hrv': d_hrv,
+        'd_rhr': d_rhr,
+        'm_hrv': m_hrv,
+        'm_rhr': m_rhr,
+        'history': valid[:5],
+        'readiness': readiness,
+        'recent_activities': recent_activities,
+        'recent_load': recent_load
+    })
+    
+    kb = [[
+        InlineKeyboardButton("✅ SIM - 20km+", callback_data='bike_yes'),
+        InlineKeyboardButton("❌ NÃO", callback_data='bike_no')
+    ]]
+    
+    await update.message.reply_text(msg)
+    await update.message.reply_text("🚴 Vais pedalar hoje (20km+)?", reply_markup=InlineKeyboardMarkup(kb))
+
+async def sync_confirmed_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback após confirmação de sincronização"""
+    query = update.callback_query
+    await query.answer()
+    
+    await query.edit_message_text("🔄 A criar pedido de sincronização...")
+    
+    # Criar flag de sync
+    success = create_sync_request()
+    
+    if not success:
+        await query.message.reply_text(
+            "❌ Falha ao criar pedido de sincronização.\n\n"
+            "Verifica /debug para mais informações."
+        )
+        context.user_data.clear()
+        return
+    
+    await query.message.reply_text(
+        "⏳ Pedido de sincronização criado.\n"
+        "O garmin-fetcher irá processar em breve (~30-60s).\n\n"
+        "Usa /status novamente após 1 minuto."
+    )
+    context.user_data.clear()
+
+async def bike_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback para decisão de ciclismo"""
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data['bike'] = (query.data == 'bike_yes')
+    await query.edit_message_text(f"🚴 Ciclismo: {'SIM' if context.user_data['bike'] else 'NÃO'}")
+    await query.message.reply_text("💭 Como te sentes hoje? (Descreve o teu estado)")
+
+async def handle_feeling(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gera plano baseado em dados + feeling"""
+    logger.info("=== Iniciando handle_feeling ===")
+    
+    if 'today' not in context.user_data:
+        logger.warning("Nenhum dado em context.user_data")
+        await update.message.reply_text("❌ Primeiro usa /status para carregar os teus dados.")
+        return
+    
+    proc_msg = await update.message.reply_text("🤖 O Coach Gemini está a processar os dados...")
+    
+    try:
+        feeling = update.message.text
+        ud = context.user_data
+        
+        logger.info(f"Feeling recebido: {feeling[:50]}...")
+        
+        h_str = "\n".join([
+            f"• {h['date']}: HRV {h['hrv']}ms, RHR {h['rhr']}bpm"
+            for h in ud['history'] if h.get('hrv') and h.get('rhr')
+        ])
+        
+        activities_str = ""
+        if ud.get('recent_activities'):
+            activities_list = []
+            for act in ud['recent_activities'][:3]:
+                try:
+                    formatted = format_activity(act)
+                    act_str = f"{formatted['sport']} {formatted['duration_min']}min"
+                    if formatted['distance_km']:
+                        act_str += f" {formatted['distance_km']}km"
+                    activities_list.append(act_str)
+                except Exception as e:
+                    logger.error(f"Erro ao formatar atividade: {e}")
+                    continue
+            
+            if activities_list:
+                activities_str = "\nAtividades recentes: " + ", ".join(activities_list)
+
+        # PROMPT OTIMIZADO
+        prompt = f"""DADOS DO ATLETA:
+📈 HRV: {ud['today']['hrv']}ms ({ud['d_hrv']:+.1f}% versus média)
+💓 RHR: {ud['today']['rhr']}bpm ({ud['d_rhr']:+.1f}% versus média)
+😴 Sono: {ud['today']['sleep']}/100
+🎯 Readiness: {ud['readiness']}
+🚴 Ciclismo hoje: {'SIM - 20km+ obrigatório' if ud['bike'] else 'NÃO'}
+
+Últimos 5 dias:
+{h_str}{activities_str}
+
+Equipamento disponível: {', '.join(EQUIPAMENTOS_GIM)}
+
+💭 SENSAÇÃO DO ATLETA: "{feeling}"
+
+TAREFA:
+Gera o plano de treino para hoje em formato tabela markdown.
+Usa PORTUGUÊS EUROPEU e cálculos em texto simples (sem LaTeX ou símbolos especiais)."""
+
+        logger.info(f"Prompt: {len(prompt)} chars")
+        
+        logger.info("A chamar Gemini API...")
+        response = model.generate_content(prompt)
+        logger.info(f"Resposta recebida: {len(response.text)} chars")
+        
+        await proc_msg.delete()
+        
+        context.user_data['last_plan'] = response.text
+        context.user_data['last_plan_date'] = ud['today']['date']
+        
+        await update.message.reply_text(f"📋 PLANO DO DIA:\n\n{response.text}")
+        logger.info("Plano enviado com sucesso")
+        
+    except Exception as e:
+        logger.error(f"=== ERRO EM handle_feeling ===")
+        logger.error(f"Tipo: {type(e).__name__}")
+        logger.error(f"Mensagem: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        
+        error_details = f"Erro: {type(e).__name__}"
+        if hasattr(e, 'message'):
+            error_details += f"\n{e.message}"
+        
+        try:
+            await proc_msg.edit_text(
+                f"❌ Falha na comunicação com o Gemini.\n\n"
+                f"{error_details}\n\n"
+                f"Verifica os logs do sistema."
+            )
+        except:
+            await update.message.reply_text(f"❌ Erro: {error_details}")
+
+async def activities_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mostra últimas atividades ordenadas por data"""
+    activities = load_activities()
+    
+    if not activities:
+        await update.message.reply_text("❌ Nenhuma atividade registada.")
+        return
+    
+    # Formatar todas as atividades
+    formatted_activities = []
+    for act in activities:
+        formatted = format_activity(act)
+        if formatted['date']:  # Apenas atividades com data válida
+            formatted_activities.append(formatted)
+    
+    # Ordenar por data (mais recente primeiro)
+    formatted_activities.sort(key=lambda x: x['date'], reverse=True)
+    
+    # Pegar últimas 10
+    recent = formatted_activities[:10]
+    
+    msg = "🏃 ÚLTIMAS ATIVIDADES:\n\n"
+    for formatted in recent:
+        msg += f"📅 {formatted['date']} - {formatted['sport']}\n"
+        msg += f"  ⏱️ Duração: {formatted['duration_min']}min"
+        
+        if formatted['distance_km']:
+            msg += f" | 📏 Dist: {formatted['distance_km']}km"
+        
+        if formatted['intensity']:
+            msg += f" | 🎯 Zona: {formatted['intensity']}"
+        
+        if formatted['load']:
+            msg += f" | 💪 Load: {formatted['load']}"
+        
+        # Nova linha se tiver HR ou calorias
+        if formatted['avg_hr'] or formatted['calories']:
+            msg += "\n  "
+            if formatted['avg_hr']:
+                msg += f"💓 FC: {formatted['avg_hr']}bpm"
+            if formatted['calories']:
+                if formatted['avg_hr']:
+                    msg += " | "
+                msg += f"🔥 Cal: {formatted['calories']}"
+        
+        msg += "\n\n"
+    
+    await update.message.reply_text(msg)
+
+async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inicia análise de aderência ao plano"""
+    keyboard = [
+        [InlineKeyboardButton("1️⃣ 1 atividade", callback_data='analyze_1')],
+        [InlineKeyboardButton("2️⃣ 2 atividades", callback_data='analyze_2')],
+        [InlineKeyboardButton("3️⃣ 3 atividades", callback_data='analyze_3')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "📊 Quantas atividades queres analisar?",
+        reply_markup=reply_markup
+    )
+
+async def analyze_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback para análise de atividades"""
+    query = update.callback_query
+    await query.answer()
+    
+    count = int(query.data.split('_')[1])
+    
+    await query.edit_message_text(f"🔍 A analisar últimas {count} atividades...")
+    
+    activities = load_activities()
+    
+    if not activities:
+        await query.message.reply_text("❌ Nenhuma atividade para analisar.")
+        return
+    
+    to_analyze = activities[-count:]
+    
+    activities_detail = ""
+    for act in to_analyze:
+        formatted = format_activity(act)
+        activities_detail += f"\nDATA: {formatted['date']}\n"
+        activities_detail += f"TIPO: {formatted['sport']}\n"
+        activities_detail += f"DURAÇÃO: {formatted['duration_min']}min\n"
+        if formatted['distance_km']:
+            activities_detail += f"DISTÂNCIA: {formatted['distance_km']}km\n"
+        if formatted['avg_hr'] != 'N/A':
+            activities_detail += f"FC MÉDIA: {formatted['avg_hr']}bpm\n"
+        activities_detail += f"CALORIAS: {formatted['calories']}\n"
+        activities_detail += "---\n"
+    
+    last_plan = context.user_data.get('last_plan', 'Nenhum plano anterior registado.')
+    
+    prompt = f"""ANÁLISE DE ADERÊNCIA AO PLANO
+
+PLANO RECOMENDADO ANTERIORMENTE:
+{last_plan}
+
+ATIVIDADES EXECUTADAS:
+{activities_detail}
+
+TAREFA:
+Analisa a aderência do atleta ao plano proposto.
+• As atividades executadas seguiram as recomendações?
+• Houve desvios de volume, intensidade ou tipo de treino?
+• Qual o impacto desses desvios nos objetivos (hipertrofia mais endurance)?
+• Que ajustes devem ser feitos no próximo plano?
+
+Sê ASSERTIVO e DIRETO. Se houve falhas, diz claramente.
+Usa PORTUGUÊS EUROPEU sem LaTeX ou símbolos especiais."""
+
+    try:
+        response = model.generate_content(prompt)
+        await query.message.reply_text(f"📊 ANÁLISE DE ADERÊNCIA:\n\n{response.text}")
+    except Exception as e:
+        logger.error(f"Erro Gemini: {e}")
+        await query.message.reply_text(
+            "❌ Falha na comunicação com o Gemini.\n"
+            "Tenta novamente."
+        )
+
+async def import_historical(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Importa dados históricos dos últimos 7 dias"""
+    
+    # Verificar health do garmin-fetcher
+    is_healthy, msg = check_garmin_fetcher_health()
+    
+    if not is_healthy:
+        await update.message.reply_text(
+            f"⚠️ AVISO: Garmin-fetcher pode não estar funcional.\n"
+            f"Motivo: {msg}\n\n"
+            f"A tentar criar pedido de importação mesmo assim..."
+        )
+    
+    await update.message.reply_text(
+        "📥 A criar pedido de importação histórica...\n"
+        "⏳ O garmin-fetcher irá processar em breve."
+    )
+    
+    success = create_import_request(7)
+    
+    if success:
+        await update.message.reply_text(
+            "✅ Pedido de importação criado.\n\n"
+            "O garmin-fetcher irá processar nos próximos minutos.\n"
+            "Isto pode demorar 2-5 minutos.\n\n"
+            "Usa /debug para verificar o progresso."
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Erro ao criar pedido de importação.\n\n"
+            "Verifica /debug para mais informações."
+        )
+
+async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Força sincronização dos dados de hoje"""
+    
+    is_healthy, msg = check_garmin_fetcher_health()
+    
+    if not is_healthy:
+        await update.message.reply_text(
+            f"⚠️ Garmin-fetcher: {msg}\n\n"
+            f"A tentar sincronizar mesmo assim..."
+        )
+    
+    await update.message.reply_text("🔄 A criar pedido de sincronização...")
+    
+    success = create_sync_request()
+    
+    if success:
+        await update.message.reply_text(
+            "✅ Pedido criado.\n\n"
+            "O garmin-fetcher irá processar em ~30-60 segundos.\n"
+            "Usa /status para verificar."
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Erro ao criar pedido.\n\n"
+            "Verifica /debug."
+        )
+
+async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando de debug para verificar estado do sistema"""
+    files = list_data_files()
+    raw_data = load_garmin_data()
+    activities = load_activities()
+    
+    # Verificar health do garmin-fetcher
+    is_healthy, health_msg = check_garmin_fetcher_health()
+    
+    msg = f"""🔧 DEBUG INFO:
+
+📁 Arquivos em /data: {len(files)}
+📊 Dados carregados: {'Sim' if raw_data else 'Não'}
+📅 Total de dias: {len(raw_data) if raw_data else 0}
+🏃 Atividades: {len(activities)}
+🐳 Garmin-fetcher: {'✅ HEALTHY' if is_healthy else '⚠️ UNHEALTHY'}
+   {health_msg}
+
+Arquivos recentes:
+{chr(10).join(files[-5:] if files else ['Nenhum'])}
+"""
+    
+    if raw_data:
+        history = parse_garmin_history(raw_data)
+        valid = [h for h in history if h['hrv'] and h['rhr']]
+        
+        msg += f"\n✅ Dias com HRV/RHR válidos: {len(valid)}"
+        
+        if history:
+            today = history[0]
+            msg += f"\n\n📊 Último dia: {today['date']}"
+            msg += f"\nHRV: {today['hrv']}"
+            msg += f"\nRHR: {today['rhr']}"
+            msg += f"\nSono: {today['sleep']}"
+    
+    # Verificar status de pedidos pendentes
+    import_status = check_request_status('import')
+    sync_status = check_request_status('sync')
+    
+    if import_status or sync_status:
+        msg += f"\n\n🚩 PEDIDOS:"
+        if import_status:
+            status_emoji = "⏳" if import_status == "pending" else ("✅" if import_status == "completed" else "❌")
+            msg += f"\n{status_emoji} Import: {import_status}"
+            
+            # Se pending, mostrar há quanto tempo
+            if import_status == "pending":
+                try:
+                    flag_path = os.path.join(DATA_DIR, 'import_request.json')
+                    with open(flag_path, 'r') as f:
+                        req = json.load(f)
+                    requested_at = datetime.fromisoformat(req['requested_at'])
+                    age = datetime.now() - requested_at
+                    msg += f" (há {int(age.total_seconds())}s)"
+                except:
+                    pass
+        
+        if sync_status:
+            status_emoji = "⏳" if sync_status == "pending" else ("✅" if sync_status == "completed" else "❌")
+            msg += f"\n{status_emoji} Sync: {sync_status}"
+            
+            # Se pending, mostrar há quanto tempo
+            if sync_status == "pending":
+                try:
+                    flag_path = os.path.join(DATA_DIR, 'sync_request.json')
+                    with open(flag_path, 'r') as f:
+                        req = json.load(f)
+                    requested_at = datetime.fromisoformat(req['requested_at'])
+                    age = datetime.now() - requested_at
+                    msg += f" (há {int(age.total_seconds())}s)"
+                except:
+                    pass
+    
+    # Verificar variáveis de ambiente
+    has_garmin_email = bool(os.getenv('GARMIN_EMAIL'))
+    has_garmin_pass = bool(os.getenv('GARMIN_PASSWORD'))
+    has_gemini_key = bool(os.getenv('GEMINI_API_KEY'))
+    
+    msg += f"\n\n🔑 VARIÁVEIS:"
+    msg += f"\nGARMIN_EMAIL: {'✅' if has_garmin_email else '❌'}"
+    msg += f"\nGARMIN_PASSWORD: {'✅' if has_garmin_pass else '❌'}"
+    msg += f"\nGEMINI_API_KEY: {'✅' if has_gemini_key else '❌'}"
+    
+    # Adicionar informação sobre última atividade
+    if activities:
+        formatted_activities = []
+        for act in activities:
+            formatted = format_activity(act)
+            if formatted['date']:
+                formatted_activities.append(formatted)
+        
+        if formatted_activities:
+            formatted_activities.sort(key=lambda x: x['date'], reverse=True)
+            last_act = formatted_activities[0]
+            msg += f"\n\n🏃 Última atividade:"
+            msg += f"\n{last_act['date']} - {last_act['sport']} ({last_act['duration_min']}min)"
+    
+    await update.message.reply_text(msg)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menu de ajuda"""
+    await update.message.reply_text(
+        "🏋️ FitnessJournal-HRV Bot v2.6\n\n"
+        "📋 COMANDOS:\n"
+        "/status - Ver readiness e dados\n"
+        "/activities - Ver últimas atividades\n"
+        "/analyze - Analisar aderência ao plano\n"
+        "/import - Importar últimos 7 dias\n"
+        "/sync - Forçar sync de hoje\n"
+        "/cleanup - Limpar flags e reorganizar atividades\n"
+        "/debug - Info de debug\n"
+        "/help - Este menu\n\n"
+        "🔄 FLUXO:\n"
+        "1️⃣ /status - Vê dados HRV/RHR\n"
+        "2️⃣ Confirma ciclismo\n"
+        "3️⃣ Descreve sensação\n"
+        "4️⃣ Recebe plano\n"
+        "5️⃣ /analyze - Analisa aderência\n\n"
+        "📡 DADOS: Garmin Connect\n"
+        "🤖 IA: Google Gemini 2.0 Flash\n\n"
+        "⚙️ ARQUITETURA:\n"
+        "Bot cria pedidos via flag files.\n"
+        "Garmin-fetcher processa automaticamente."
+    )
+
+async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Limpa flags antigos e reorganiza atividades"""
+    await update.message.reply_text("🧹 A executar limpeza...")
+    
+    try:
+        # Limpar flags
+        cleaned_flags, flag_messages = cleanup_old_flags()
+        
+        # Reorganizar atividades
+        duplicates, total, activity_messages = reorganize_activities()
+        
+        # Montar mensagem
+        msg = "🧹 LIMPEZA COMPLETA\n\n"
+        
+        msg += "📋 FLAGS:\n"
+        for m in flag_messages:
+            msg += f"{m}\n"
+        
+        msg += f"\n🏃 ATIVIDADES:\n"
+        for m in activity_messages:
+            msg += f"{m}\n"
+        
+        msg += f"\n{'='*30}\n"
+        msg += f"✅ Flags limpos: {cleaned_flags}\n"
+        msg += f"✅ Duplicados removidos: {duplicates}\n"
+        msg += f"✅ Total de atividades: {total}"
+        
+        await update.message.reply_text(msg)
+        logger.info(f"Cleanup executado: {cleaned_flags} flags, {duplicates} duplicados")
+        
+    except Exception as e:
+        logger.error(f"Erro no cleanup: {e}")
+        await update.message.reply_text(f"❌ Erro ao executar limpeza:\n{e}")
+
+def main():
+    """Inicia o bot"""
+    logger.info("=== FitnessJournal-HRV Bot v2.6 ===")
+    logger.info(f"Data dir: {DATA_DIR}")
+    
+    # Verificar API keys
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        logger.error("❌ GEMINI_API_KEY não configurada!")
+    else:
+        logger.info(f"✅ API Key presente: {api_key[:10]}...")
+    
+    garmin_email = os.environ.get("GARMIN_EMAIL")
+    garmin_pass = os.environ.get("GARMIN_PASSWORD")
+    
+    if not garmin_email or not garmin_pass:
+        logger.warning("⚠️ Credenciais Garmin não configuradas completamente")
+    else:
+        logger.info(f"✅ Garmin email: {garmin_email}")
+    
+    # Verificar arquivos no startup
+    files = list_data_files()
+    activities = load_activities()
+    logger.info(f"📁 Arquivos encontrados: {len(files)}")
+    logger.info(f"🏃 Atividades: {len(activities)}")
+    
+    # Verificar health garmin-fetcher
+    is_healthy, health_msg = check_garmin_fetcher_health()
+    logger.info(f"🐳 Garmin-fetcher: {'HEALTHY' if is_healthy else 'UNHEALTHY'} - {health_msg}")
+    
+    # AUTO-CLEANUP no arranque
+    logger.info("🧹 A executar auto-cleanup...")
+    auto_cleanup_on_startup()
+    
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    # Handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("activities", activities_command))
+    app.add_handler(CommandHandler("analyze", analyze_command))
+    app.add_handler(CommandHandler("import", import_historical))
+    app.add_handler(CommandHandler("sync", sync_command))
+    app.add_handler(CommandHandler("cleanup", cleanup_command))
+    app.add_handler(CommandHandler("debug", debug_command))
+    app.add_handler(CommandHandler("help", help_command))
+    
+    # Verificação rigorosa das aspas aqui:
+    app.add_handler(CallbackQueryHandler(sync_confirmed_callback, pattern=r'^sync_confirmed'))
+    app.add_handler(CallbackQueryHandler(analyze_callback, pattern=r'^analyze_'))
+    app.add_handler(CallbackQueryHandler(bike_callback, pattern=r'^bike_'))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_feeling))
+    
+    logger.info("✅ Bot iniciado e aguardando comandos")
+    print("🤖 Bot ativo - Aguardando comandos...")
+    app.run_polling()
+
+if __name__ == '__main__':
+    main()
