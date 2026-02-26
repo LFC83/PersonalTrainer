@@ -1,0 +1,25 @@
+services:
+  garmin-fetcher:
+    build: ./garmin-fetcher
+    container_name: fitnessjournal-hrv-garmin-fetcher
+    env_file: .env
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+    command: python fetcher.py
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; exit(0 if os.path.exists('/data/garmin_data_consolidated.json') else 1)"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+
+  telegram-bot:
+    build: ./telegram-bot
+    container_name: fitnessjournal-hrv-telegram-bot
+    env_file: .env
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+    depends_on:
+      - garmin-fetcher
+    command: python main.py
