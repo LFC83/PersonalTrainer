@@ -575,14 +575,14 @@ def get_all_formatted_activities() -> List[FormattedActivity]:
     
     return formatted_activities
 
-def find_activity_for_analysis() -> Tuple[Optional[FormattedActivity], str]:
+def find_activities_for_analysis() -> Tuple[List[FormattedActivity], str, str]:
     """
-    Encontra a atividade apropriada para análise seguindo as regras:
-    1. Se existe atividade de hoje → usar hoje
-    2. Se não existe hoje mas existe ontem → usar ontem
-    3. Se não existe hoje nem ontem → retornar None com mensagem
+    Encontra TODAS as atividades apropriadas para análise seguindo as regras:
+    1. Se existem atividades de hoje → usar todas de hoje
+    2. Se não existe hoje mas existe ontem → usar todas de ontem
+    3. Se não existe hoje nem ontem → retornar lista vazia com mensagem
     
-    Retorna: (atividade, mensagem_contexto)
+    Retorna: (lista_atividades, data_analisada, mensagem_contexto)
     """
     today_str = datetime.now().strftime('%Y-%m-%d')
     yesterday_str = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
@@ -590,24 +590,28 @@ def find_activity_for_analysis() -> Tuple[Optional[FormattedActivity], str]:
     all_activities = get_all_formatted_activities()
     
     if not all_activities:
-        return None, "❌ Não existem atividades registadas no sistema."
+        return [], "", "❌ Não existem atividades registadas no sistema."
     
-    # Procurar atividade de hoje
+    # Procurar TODAS as atividades de hoje
     today_activities = [act for act in all_activities if act.date == today_str]
     if today_activities:
-        return today_activities[0], f"✅ Encontrada atividade de hoje ({today_str})"
+        count = len(today_activities)
+        msg = f"✅ Encontrada{'s' if count > 1 else ''} {count} atividade{'s' if count > 1 else ''} de hoje ({today_str})"
+        return today_activities, today_str, msg
     
-    # Procurar atividade de ontem
+    # Procurar TODAS as atividades de ontem
     yesterday_activities = [act for act in all_activities if act.date == yesterday_str]
     if yesterday_activities:
-        return yesterday_activities[0], f"ℹ️  Não há atividade de hoje. A usar atividade de ontem ({yesterday_str})"
+        count = len(yesterday_activities)
+        msg = f"ℹ️  Não há atividade de hoje. Encontrada{'s' if count > 1 else ''} {count} atividade{'s' if count > 1 else ''} de ontem ({yesterday_str})"
+        return yesterday_activities, yesterday_str, msg
     
     # Não encontrou hoje nem ontem
     most_recent = all_activities[0]
-    return None, (
+    return [], "", (
         f"❌ Não existem atividades de hoje ({today_str}) nem ontem ({yesterday_str}).\n\n"
         f"Última atividade registada: {most_recent.date} - {most_recent.sport}\n\n"
-        f"Para analisar aderência ao plano, preciso de uma atividade recente (hoje ou ontem)."
+        f"Para analisar aderência ao plano, preciso de atividades recentes (hoje ou ontem)."
     )
 
 # ==========================================
@@ -1139,74 +1143,136 @@ async def activities_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Analisa aderência ao plano com validação rigorosa:
-    1. Procura atividade de hoje
-    2. Se não existir, procura de ontem
+    1. Procura TODAS as atividades de hoje
+    2. Se não existir, procura TODAS as atividades de ontem
     3. Se não existir nenhuma, informa o utilizador
+    4. Compara TODAS as atividades encontradas com o plano (suporta planos mistos)
     """
     user_id = update.effective_user.id
     logger.info(f"analyze_command from user {user_id}")
     
-    await update.message.reply_text("🔍 A procurar atividade para análise...")
+    await update.message.reply_text("🔍 A procurar atividades para análise...")
     
-    # NOVA VALIDAÇÃO: Encontrar atividade apropriada
-    activity_to_analyze, context_message = find_activity_for_analysis()
+    # NOVA VALIDAÇÃO: Encontrar TODAS as atividades do dia apropriado
+    activities_to_analyze, analysis_date, context_message = find_activities_for_analysis()
     
-    if activity_to_analyze is None:
-        # Não há atividade válida para analisar
+    if not activities_to_analyze:
+        # Não há atividades válidas para analisar
         await update.message.reply_text(context_message)
         return
     
-    # Informar qual atividade será analisada
-    await update.message.reply_text(
-        f"{context_message}\n\n"
-        f"📋 Atividade a analisar:\n"
-        f"{activity_to_analyze.to_detailed_summary()}"
-    )
+    # Informar quais atividades serão analisadas
+    activities_summary = f"{context_message}\n\n📋 Atividade{'s' if len(activities_to_analyze) > 1 else ''} a analisar:\n\n"
     
-    # Preparar dados para análise
-    activities_detail = f"DATA: {activity_to_analyze.date}\n"
-    activities_detail += f"TIPO: {activity_to_analyze.sport}\n"
-    activities_detail += f"DURAÇÃO: {activity_to_analyze.duration_min}min\n"
-    if activity_to_analyze.distance_km:
-        activities_detail += f"DISTÂNCIA: {activity_to_analyze.distance_km}km\n"
-    if activity_to_analyze.avg_hr:
-        activities_detail += f"FC MÉDIA: {activity_to_analyze.avg_hr}bpm\n"
-    if activity_to_analyze.calories:
-        activities_detail += f"CALORIAS: {activity_to_analyze.calories}\n"
-    if activity_to_analyze.intensity:
-        activities_detail += f"INTENSIDADE: {activity_to_analyze.intensity}\n"
-    if activity_to_analyze.load:
-        activities_detail += f"LOAD: {activity_to_analyze.load}\n"
+    for i, act in enumerate(activities_to_analyze, 1):
+        if len(activities_to_analyze) > 1:
+            activities_summary += f"**Atividade {i}:**\n"
+        activities_summary += act.to_detailed_summary() + "\n\n"
     
+    await update.message.reply_text(activities_summary)
+    
+    # Preparar dados detalhados de TODAS as atividades para o Gemini
+    activities_detail = f"DATA ANALISADA: {analysis_date}\n"
+    activities_detail += f"TOTAL DE ATIVIDADES EXECUTADAS: {len(activities_to_analyze)}\n\n"
+    
+    for i, act in enumerate(activities_to_analyze, 1):
+        activities_detail += f"{'='*50}\n"
+        activities_detail += f"ATIVIDADE {i} de {len(activities_to_analyze)}:\n"
+        activities_detail += f"{'='*50}\n"
+        activities_detail += f"TIPO: {act.sport}\n"
+        activities_detail += f"DURAÇÃO: {act.duration_min}min\n"
+        
+        if act.distance_km:
+            activities_detail += f"DISTÂNCIA: {act.distance_km}km\n"
+        if act.avg_hr:
+            activities_detail += f"FC MÉDIA: {act.avg_hr}bpm\n"
+        if act.calories:
+            activities_detail += f"CALORIAS: {act.calories}\n"
+        if act.intensity:
+            activities_detail += f"INTENSIDADE: {act.intensity}\n"
+        if act.load:
+            activities_detail += f"LOAD: {act.load}\n"
+        
+        activities_detail += "\n"
+    
+    # Recuperar plano anterior
     state = get_session_state(context)
-    last_plan = state.last_plan if state else 'Nenhum plano anterior registado.'
+    last_plan = state.last_plan if state and state.last_plan else 'Nenhum plano anterior registado.'
+    last_plan_date = state.last_plan_date if state and state.last_plan_date else 'Data desconhecida'
     
+    # Construir prompt inteligente para análise
     prompt = f"""ANÁLISE DE ADERÊNCIA AO PLANO
 
-PLANO RECOMENDADO ANTERIORMENTE:
+PLANO RECOMENDADO:
+Data do plano: {last_plan_date}
 {last_plan}
 
-ATIVIDADE EXECUTADA:
+ATIVIDADES EXECUTADAS:
 {activities_detail}
 
-TAREFA:
-Analisa a aderência do atleta ao plano proposto.
-• A atividade executada seguiu as recomendações?
-• Houve desvios de volume, intensidade ou tipo de treino?
-• Qual o impacto desses desvios nos objetivos (hipertrofia mais endurance)?
-• Que ajustes devem ser feitos no próximo plano?
+CONTEXTO IMPORTANTE:
+- Se o plano incluía múltiplas sessões (ex: Ginásio mais Remo, Ciclismo mais Ginásio), verifica se TODAS foram executadas.
+- Se apenas ALGUMAS sessões foram executadas, identifica claramente o que falta.
+- Se foram executadas atividades DIFERENTES das planeadas, analisa o impacto dessa substituição.
+- Considera que atividades podem ter sido divididas ao longo do dia (ex: Ginásio de manhã, Remo à tarde).
 
-Sê ASSERTIVO e DIRETO. Se houve falhas, diz claramente.
+TAREFA:
+Faz uma análise COMPLETA da aderência ao plano:
+
+1. VERIFICAÇÃO DE COMPLETUDE:
+   - O plano tinha quantas sessões previstas?
+   - Quantas sessões foram executadas?
+   - Se faltou alguma sessão, qual e por quê pode ter impacto?
+
+2. ANÁLISE DE CADA ATIVIDADE EXECUTADA:
+   - Volume (duração/distância) compatível com plano?
+   - Intensidade (FC/Load) compatível com plano?
+   - Tipo de treino correto?
+
+3. DESVIOS E SUBSTITUIÇÕES:
+   - Houve substituição de atividades? (ex: planeou Remo mas fez Ciclismo)
+   - Se sim, essa substituição é equivalente ou prejudica objetivos?
+   - Houve desvios de volume ou intensidade?
+
+4. IMPACTO NOS OBJETIVOS:
+   - Considerando objetivos de hipertrofia mais endurance
+   - O que foi executado contribui adequadamente?
+   - Que estímulos ficaram em falta?
+
+5. RECOMENDAÇÕES PARA PRÓXIMO PLANO:
+   - Ajustes necessários no volume
+   - Ajustes necessários na periodização
+   - Prioridades para recuperar estímulos em falta
+   - Se a aderência foi perfeita, como progredir?
+
+Sê ASSERTIVO e DIRETO. Se houve falhas ou omissões, diz claramente o que faltou e qual o impacto.
+Se o atleta executou apenas parte do plano, não suavizes: diz que ficou incompleto e explica as consequências.
 Usa PORTUGUÊS EUROPEU sem LaTeX ou símbolos especiais."""
 
     try:
-        proc_msg = await update.message.reply_text("🤖 A analisar aderência ao plano...")
+        proc_msg = await update.message.reply_text("🤖 A analisar aderência ao plano com o Coach Gemini...")
+        
+        start_time = time.time()
         response = model.generate_content(prompt)
+        duration_ms = (time.time() - start_time) * 1000
+        
+        logger.info(f"Analyze completed for user {user_id} - {len(activities_to_analyze)} activities analyzed - {duration_ms:.0f}ms")
+        
         await proc_msg.delete()
-        await update.message.reply_text(f"📊 ANÁLISE DE ADERÊNCIA:\n\n{response.text}")
-        logger.info(f"Analyze completed for user {user_id}")
+        
+        # Se a análise for muito longa, dividir em partes
+        analysis_text = response.text
+        
+        if len(analysis_text) > 4000:
+            parts = [analysis_text[i:i+4000] for i in range(0, len(analysis_text), 4000)]
+            await update.message.reply_text(f"📊 ANÁLISE DE ADERÊNCIA - Parte 1/{len(parts)}:\n\n{parts[0]}")
+            for i, part in enumerate(parts[1:], 2):
+                await update.message.reply_text(f"📊 ANÁLISE DE ADERÊNCIA - Parte {i}/{len(parts)}:\n\n{part}")
+        else:
+            await update.message.reply_text(f"📊 ANÁLISE DE ADERÊNCIA:\n\n{analysis_text}")
+        
     except Exception as e:
-        logger.error(f"Gemini error in analyze: {e}")
+        logger.error(f"Gemini error in analyze for user {user_id}: {e}")
         await update.message.reply_text(
             "❌ Falha na comunicação com o Gemini.\n"
             "Tenta novamente."
