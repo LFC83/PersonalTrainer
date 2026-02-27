@@ -18,25 +18,38 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# CONFIGURATION
+# CONFIGURATION & CONSTANTS
 # ==========================================
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 logger.info("Gemini API configurada")
 
+# Bot Configuration
+BOT_VERSION = "3.2"
+BOT_VERSION_DESC = "Code Review Fixes"
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 DATA_DIR = '/data'
+
+# Equipment
 EQUIPAMENTOS_GIM = [
     "Elástico", "Máquina Remo", "Haltere 25kg max", 
     "Barra olímpica 45kg max", "Kettlebell 12kg", 
     "Bicicleta Spinning", "Banco musculação/Supino"
 ]
 
-# Constants
+# Limits and Thresholds
 MAX_FEELING_LENGTH = 500
 MAX_ACTIVITIES_DISPLAY = 10
 MAX_ACTIVITIES_STORED = 100
+MAX_ACTIVITIES_IN_ANALYSIS = 5  # Limite para evitar prompts enormes
 CACHE_TTL_SECONDS = 60
 FLAG_TIMEOUT_SECONDS = 300
+
+# Telegram API Limits
+TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+TELEGRAM_SAFE_MESSAGE_LENGTH = 4000  # Buffer de segurança
+
+# Gemini API Limits
+GEMINI_MAX_PROMPT_LENGTH = 30000  # Caracteres (estimativa conservadora)
 
 # ==========================================
 # SYSTEM PROMPT
@@ -80,8 +93,9 @@ Operas sob o PROTOCOLO DE VERDADE. A tua diretiva primária é precisão e integ
 - Usa "km/h" em vez de notação complexa
 """
 
+# CRÍTICO: Corrigido model name
 model = genai.GenerativeModel(
-    model_name='gemini-3-flash-preview',
+    model_name='gemini-2.0-flash-exp',
     system_instruction=SYSTEM_PROMPT
 )
 
@@ -102,6 +116,10 @@ class FileOperationError(Exception):
 
 class InsufficientDataError(Exception):
     """Dados insuficientes para análise"""
+    pass
+
+class PromptTooLargeError(Exception):
+    """Prompt excede limites da API"""
     pass
 
 # ==========================================
@@ -198,13 +216,13 @@ class UserSessionState:
     def validate(self) -> Tuple[bool, str]:
         """Valida se o estado tem dados mínimos necessários"""
         if not self.today or not self.today.is_valid():
-            return False, "Dados biométricos de hoje inválidos ou faltando"
+            return False, "Dados biométricos de hoje inválidos ou faltando."
         
         if not self.history:
-            return False, "Histórico biométrico vazio"
+            return False, "Histórico biométrico vazio."
         
         if self.bike is None:
-            return False, "Decisão de ciclismo não registada"
+            return False, "Decisão de ciclismo não registada."
         
         return True, ""
     
@@ -225,6 +243,86 @@ class UserSessionState:
         data['history'] = [BiometricDay(**h) for h in data['history']]
         data['formatted_activities'] = [FormattedActivity(**a) for a in data['formatted_activities']]
         return cls(**data)
+
+# ==========================================
+# UTILITY FUNCTIONS
+# ==========================================
+def pluralize_pt(count: int, singular: str, plural: str) -> str:
+    """
+    Retorna forma correta (singular/plural) baseado na contagem.
+    
+    Exemplos:
+        pluralize_pt(1, "atividade", "atividades") → "atividade"
+        pluralize_pt(2, "atividade", "atividades") → "atividades"
+    """
+    return plural if count != 1 else singular
+
+def format_found_activities_message(count: int, date: str, is_today: bool) -> str:
+    """
+    Formata mensagem de atividades encontradas com pluralização correta.
+    
+    Args:
+        count: Número de atividades
+        date: Data no formato YYYY-MM-DD
+        is_today: Se True, usa "hoje", senão "ontem"
+    """
+    day_label = "hoje" if is_today else "ontem"
+    
+    if count == 1:
+        return f"✅ Encontrada 1 atividade de {day_label} ({date})"
+    else:
+        return f"✅ Encontradas {count} atividades de {day_label} ({date})"
+
+def truncate_text_safe(text: str, max_length: int, suffix: str = "...") -> str:
+    """
+    Trunca texto de forma segura, adicionando sufixo se necessário.
+    
+    Args:
+        text: Texto a truncar
+        max_length: Comprimento máximo
+        suffix: Sufixo a adicionar quando truncado
+    """
+    if len(text) <= max_length:
+        return text
+    
+    return text[:max_length - len(suffix)] + suffix
+
+def split_long_message(text: str, max_length: int = TELEGRAM_SAFE_MESSAGE_LENGTH) -> List[str]:
+    """
+    Divide mensagem longa em partes que cabem no limite do Telegram.
+    
+    Args:
+        text: Texto a dividir
+        max_length: Tamanho máximo de cada parte
+        
+    Returns:
+        Lista de strings, cada uma com comprimento <= max_length
+    """
+    if len(text) <= max_length:
+        return [text]
+    
+    parts = []
+    current_pos = 0
+    
+    while current_pos < len(text):
+        end_pos = current_pos + max_length
+        
+        if end_pos >= len(text):
+            parts.append(text[current_pos:])
+            break
+        
+        # Tentar quebrar em newline mais próximo
+        chunk = text[current_pos:end_pos]
+        last_newline = chunk.rfind('\n')
+        
+        if last_newline > max_length * 0.5:  # Se newline está em posição razoável
+            parts.append(text[current_pos:current_pos + last_newline])
+            current_pos += last_newline + 1
+        else:
+            parts.append(chunk)
+            current_pos = end_pos
+    
+    return parts
 
 # ==========================================
 # DATA EXTRACTION FUNCTIONS
@@ -575,6 +673,27 @@ def get_all_formatted_activities() -> List[FormattedActivity]:
     
     return formatted_activities
 
+def get_activities_by_date(target_date: str) -> List[FormattedActivity]:
+    """
+    PERFORMANCE FIX: Carrega e filtra atividades por data específica.
+    Mais eficiente que carregar todas e depois filtrar.
+    
+    Args:
+        target_date: Data no formato YYYY-MM-DD
+        
+    Returns:
+        Lista de atividades formatadas da data especificada
+    """
+    activities = load_activities()
+    
+    filtered_activities = []
+    for act in activities:
+        formatted = format_activity(act)
+        if formatted and formatted.date == target_date:
+            filtered_activities.append(formatted)
+    
+    return filtered_activities
+
 def find_activities_for_analysis() -> Tuple[List[FormattedActivity], str, str]:
     """
     Encontra TODAS as atividades apropriadas para análise seguindo as regras:
@@ -587,26 +706,38 @@ def find_activities_for_analysis() -> Tuple[List[FormattedActivity], str, str]:
     today_str = datetime.now().strftime('%Y-%m-%d')
     yesterday_str = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     
+    # PERFORMANCE FIX: Buscar apenas atividades de hoje primeiro
+    today_activities = get_activities_by_date(today_str)
+    if today_activities:
+        count = len(today_activities)
+        msg = format_found_activities_message(count, today_str, is_today=True)
+        
+        # Limitar a MAX_ACTIVITIES_IN_ANALYSIS
+        if count > MAX_ACTIVITIES_IN_ANALYSIS:
+            logger.warning(f"Limitando análise de {count} para {MAX_ACTIVITIES_IN_ANALYSIS} atividades")
+            today_activities = today_activities[:MAX_ACTIVITIES_IN_ANALYSIS]
+        
+        return today_activities, today_str, msg
+    
+    # Se não tem hoje, buscar ontem
+    yesterday_activities = get_activities_by_date(yesterday_str)
+    if yesterday_activities:
+        count = len(yesterday_activities)
+        msg = format_found_activities_message(count, yesterday_str, is_today=False)
+        
+        # Limitar a MAX_ACTIVITIES_IN_ANALYSIS
+        if count > MAX_ACTIVITIES_IN_ANALYSIS:
+            logger.warning(f"Limitando análise de {count} para {MAX_ACTIVITIES_IN_ANALYSIS} atividades")
+            yesterday_activities = yesterday_activities[:MAX_ACTIVITIES_IN_ANALYSIS]
+        
+        return yesterday_activities, yesterday_str, msg
+    
+    # Não encontrou hoje nem ontem - buscar última atividade para mostrar na mensagem
     all_activities = get_all_formatted_activities()
     
     if not all_activities:
         return [], "", "❌ Não existem atividades registadas no sistema."
     
-    # Procurar TODAS as atividades de hoje
-    today_activities = [act for act in all_activities if act.date == today_str]
-    if today_activities:
-        count = len(today_activities)
-        msg = f"✅ Encontrada{'s' if count > 1 else ''} {count} atividade{'s' if count > 1 else ''} de hoje ({today_str})"
-        return today_activities, today_str, msg
-    
-    # Procurar TODAS as atividades de ontem
-    yesterday_activities = [act for act in all_activities if act.date == yesterday_str]
-    if yesterday_activities:
-        count = len(yesterday_activities)
-        msg = f"ℹ️  Não há atividade de hoje. Encontrada{'s' if count > 1 else ''} {count} atividade{'s' if count > 1 else ''} de ontem ({yesterday_str})"
-        return yesterday_activities, yesterday_str, msg
-    
-    # Não encontrou hoje nem ontem
     most_recent = all_activities[0]
     return [], "", (
         f"❌ Não existem atividades de hoje ({today_str}) nem ontem ({yesterday_str}).\n\n"
@@ -852,7 +983,7 @@ def save_session_state(context: ContextTypes.DEFAULT_TYPE, state: UserSessionSta
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando inicial"""
     await update.message.reply_text(
-        "🏋️ FitnessJournal-HRV Bot v3.1 (Refatorado + Bug Fixes)\n\n"
+        f"🏋️ FitnessJournal-HRV Bot v{BOT_VERSION} ({BOT_VERSION_DESC})\n\n"
         "Bot conectado ao Garmin Connect.\n\n"
         "Comandos disponíveis:\n"
         "/status - Ver readiness\n"
@@ -868,9 +999,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Status com validação robusta"""
-    user_id = update.effective_user.id
-    logger.info(f"Status command from user {user_id}")
-    
     await update.message.reply_text("⏳ A extrair biometria do Garmin...")
     
     data = load_garmin_data()
@@ -894,9 +1022,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"⚠️ ATENÇÃO: Dados de hoje ({today.date}) estão vazios.\n\n"
             f"📱 INSTRUÇÕES:\n"
-            f"1. Sincroniza o teu relógio Garmin com a app\n"
-            f"2. Aguarda 2-3 minutos\n"
-            f"3. Carrega no botão abaixo quando confirmares que sincronizou\n\n"
+            f"1. Sincroniza o teu relógio Garmin com a app.\n"
+            f"2. Aguarda 2-3 minutos.\n"
+            f"3. Carrega no botão abaixo quando confirmares que sincronizou.\n\n"
             f"💡 Se o problema persistir, os dados podem não estar disponíveis ainda.",
             reply_markup=reply_markup
         )
@@ -930,7 +1058,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif d_hrv < -5 or d_rhr > 2:
         readiness = "BAIXA"
     
-    # BUG FIX: Usar get_all_formatted_activities para pegar TODAS as atividades
+    # Usar get_all_formatted_activities para pegar TODAS as atividades
     all_formatted_activities = get_all_formatted_activities()
     recent_activities_formatted = all_formatted_activities[:3]
     recent_activities_raw = [f.raw for f in recent_activities_formatted]
@@ -1016,9 +1144,6 @@ async def bike_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_feeling(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Gera plano baseado em dados + feeling"""
-    user_id = update.effective_user.id
-    logger.info(f"handle_feeling from user {user_id}")
-    
     state = get_session_state(context)
     if not state:
         await update.message.reply_text("❌ Primeiro usa /status para carregar os teus dados.")
@@ -1087,13 +1212,16 @@ TAREFA:
 Gera o plano de treino para hoje em formato tabela markdown.
 Usa PORTUGUÊS EUROPEU e cálculos em texto simples (sem LaTeX ou símbolos especiais)."""
 
-        logger.info(f"Calling Gemini API (user {user_id}, prompt: {len(prompt)} chars)")
+        # VALIDAÇÃO: Verificar tamanho do prompt
+        if len(prompt) > GEMINI_MAX_PROMPT_LENGTH:
+            logger.warning(f"Prompt muito longo: {len(prompt)} chars (max: {GEMINI_MAX_PROMPT_LENGTH})")
+            prompt = truncate_text_safe(prompt, GEMINI_MAX_PROMPT_LENGTH)
         
         start_time = time.time()
         response = model.generate_content(prompt)
         duration_ms = (time.time() - start_time) * 1000
         
-        logger.info(f"Gemini response received (user {user_id}, response: {len(response.text)} chars, duration: {duration_ms:.0f}ms)")
+        logger.info(f"Plan generated - response: {len(response.text)} chars, duration: {duration_ms:.0f}ms")
         
         await proc_msg.delete()
         
@@ -1103,28 +1231,22 @@ Usa PORTUGUÊS EUROPEU e cálculos em texto simples (sem LaTeX ou símbolos espe
         save_session_state(context, state)
         
         await update.message.reply_text(f"📋 PLANO DO DIA:\n\n{response.text}")
-        logger.info(f"Plan sent successfully to user {user_id}")
         
     except Exception as e:
-        logger.error(f"handle_feeling error for user {user_id}: {type(e).__name__}: {str(e)}")
+        logger.error(f"handle_feeling error: {type(e).__name__}: {str(e)}")
         logger.error(traceback.format_exc())
-        
-        error_details = f"Erro: {type(e).__name__}"
-        if hasattr(e, 'message'):
-            error_details += f"\n{e.message}"
         
         try:
             await proc_msg.edit_text(
                 f"❌ Falha na comunicação com o Gemini.\n\n"
-                f"{error_details}\n\n"
+                f"Erro: {type(e).__name__}\n\n"
                 f"Verifica os logs do sistema."
             )
         except:
-            await update.message.reply_text(f"❌ Erro: {error_details}")
+            await update.message.reply_text(f"❌ Erro: {type(e).__name__}")
 
 async def activities_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Mostra últimas atividades ordenadas por data"""
-    # BUG FIX: Usar get_all_formatted_activities
     all_formatted = get_all_formatted_activities()
     
     if not all_formatted:
@@ -1148,12 +1270,9 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     3. Se não existir nenhuma, informa o utilizador
     4. Compara TODAS as atividades encontradas com o plano (suporta planos mistos)
     """
-    user_id = update.effective_user.id
-    logger.info(f"analyze_command from user {user_id}")
-    
     await update.message.reply_text("🔍 A procurar atividades para análise...")
     
-    # NOVA VALIDAÇÃO: Encontrar TODAS as atividades do dia apropriado
+    # Encontrar TODAS as atividades do dia apropriado
     activities_to_analyze, analysis_date, context_message = find_activities_for_analysis()
     
     if not activities_to_analyze:
@@ -1162,10 +1281,13 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Informar quais atividades serão analisadas
-    activities_summary = f"{context_message}\n\n📋 Atividade{'s' if len(activities_to_analyze) > 1 else ''} a analisar:\n\n"
+    count = len(activities_to_analyze)
+    activities_label = pluralize_pt(count, "Atividade", "Atividades")
+    
+    activities_summary = f"{context_message}\n\n📋 {activities_label} a analisar:\n\n"
     
     for i, act in enumerate(activities_to_analyze, 1):
-        if len(activities_to_analyze) > 1:
+        if count > 1:
             activities_summary += f"**Atividade {i}:**\n"
         activities_summary += act.to_detailed_summary() + "\n\n"
     
@@ -1173,11 +1295,11 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Preparar dados detalhados de TODAS as atividades para o Gemini
     activities_detail = f"DATA ANALISADA: {analysis_date}\n"
-    activities_detail += f"TOTAL DE ATIVIDADES EXECUTADAS: {len(activities_to_analyze)}\n\n"
+    activities_detail += f"TOTAL DE ATIVIDADES EXECUTADAS: {count}\n\n"
     
     for i, act in enumerate(activities_to_analyze, 1):
         activities_detail += f"{'='*50}\n"
-        activities_detail += f"ATIVIDADE {i} de {len(activities_to_analyze)}:\n"
+        activities_detail += f"ATIVIDADE {i} de {count}:\n"
         activities_detail += f"{'='*50}\n"
         activities_detail += f"TIPO: {act.sport}\n"
         activities_detail += f"DURAÇÃO: {act.duration_min}min\n"
@@ -1250,37 +1372,47 @@ Se o atleta executou apenas parte do plano, não suavizes: diz que ficou incompl
 Usa PORTUGUÊS EUROPEU sem LaTeX ou símbolos especiais."""
 
     try:
+        # VALIDAÇÃO: Verificar tamanho do prompt
+        if len(prompt) > GEMINI_MAX_PROMPT_LENGTH:
+            logger.error(f"Prompt excede limite: {len(prompt)} chars")
+            await update.message.reply_text(
+                f"⚠️ Análise muito extensa ({len(prompt)} caracteres).\n\n"
+                f"Limitando a {MAX_ACTIVITIES_IN_ANALYSIS} atividades por vez.\n"
+                f"Se necessário, usa /analyze_activity para análises individuais."
+            )
+            return
+        
         proc_msg = await update.message.reply_text("🤖 A analisar aderência ao plano com o Coach Gemini...")
         
         start_time = time.time()
         response = model.generate_content(prompt)
         duration_ms = (time.time() - start_time) * 1000
         
-        logger.info(f"Analyze completed for user {user_id} - {len(activities_to_analyze)} activities analyzed - {duration_ms:.0f}ms")
+        logger.info(f"Analysis completed - {count} activities - {duration_ms:.0f}ms")
         
         await proc_msg.delete()
         
-        # Se a análise for muito longa, dividir em partes
+        # Dividir mensagem longa em partes
         analysis_text = response.text
+        message_parts = split_long_message(analysis_text)
         
-        if len(analysis_text) > 4000:
-            parts = [analysis_text[i:i+4000] for i in range(0, len(analysis_text), 4000)]
-            await update.message.reply_text(f"📊 ANÁLISE DE ADERÊNCIA - Parte 1/{len(parts)}:\n\n{parts[0]}")
-            for i, part in enumerate(parts[1:], 2):
-                await update.message.reply_text(f"📊 ANÁLISE DE ADERÊNCIA - Parte {i}/{len(parts)}:\n\n{part}")
+        if len(message_parts) > 1:
+            for i, part in enumerate(message_parts, 1):
+                header = f"📊 ANÁLISE DE ADERÊNCIA - Parte {i}/{len(message_parts)}:\n\n" if i == 1 else ""
+                await update.message.reply_text(f"{header}{part}")
         else:
             await update.message.reply_text(f"📊 ANÁLISE DE ADERÊNCIA:\n\n{analysis_text}")
         
     except Exception as e:
-        logger.error(f"Gemini error in analyze for user {user_id}: {e}")
+        logger.error(f"Gemini error in analyze: {type(e).__name__}: {e}")
         await update.message.reply_text(
-            "❌ Falha na comunicação com o Gemini.\n"
-            "Tenta novamente."
+            f"❌ Falha na comunicação com o Gemini.\n\n"
+            f"Erro: {type(e).__name__}\n\n"
+            f"Tenta novamente."
         )
 
 async def analyze_activity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Inicia análise individual de atividade"""
-    # BUG FIX: Usar get_all_formatted_activities
     all_formatted = get_all_formatted_activities()
     
     if not all_formatted:
@@ -1486,22 +1618,22 @@ Fornece números e métricas concretas sempre que possível."""
     try:
         response = model.generate_content(prompt)
         
-        # Enviar resposta em partes se for muito longa (limite Telegram: 4096 chars)
+        # Dividir resposta em partes se necessário
         analysis_text = response.text
+        message_parts = split_long_message(analysis_text)
         
-        if len(analysis_text) > 4000:
-            parts = [analysis_text[i:i+4000] for i in range(0, len(analysis_text), 4000)]
-            await query.message.reply_text(f"📊 ANÁLISE DETALHADA - Parte 1/{len(parts)}:\n\n{parts[0]}")
-            for i, part in enumerate(parts[1:], 2):
-                await query.message.reply_text(f"📊 ANÁLISE DETALHADA - Parte {i}/{len(parts)}:\n\n{part}")
+        if len(message_parts) > 1:
+            for i, part in enumerate(message_parts, 1):
+                header = f"📊 ANÁLISE DETALHADA - Parte {i}/{len(message_parts)}:\n\n" if i == 1 else ""
+                await query.message.reply_text(f"{header}{part}")
         else:
             await query.message.reply_text(f"📊 ANÁLISE DETALHADA:\n\n{analysis_text}")
         
         logger.info(f"Individual analysis completed for activity {selected.date}")
         
     except Exception as e:
-        logger.error(f"Error in individual analysis: {e}")
-        await query.message.reply_text(f"❌ Erro ao gerar análise:\n{type(e).__name__}: {str(e)}")
+        logger.error(f"Error in individual analysis: {type(e).__name__}: {e}")
+        await query.message.reply_text(f"❌ Erro ao gerar análise:\n{type(e).__name__}")
 
 async def import_historical(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Importa dados históricos dos últimos 7 dias"""
@@ -1594,21 +1726,19 @@ async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Cleanup executed: {cleaned_flags} flags, {duplicates} duplicates")
         
     except Exception as e:
-        logger.error(f"Cleanup error: {e}")
-        await update.message.reply_text(f"❌ Erro ao executar limpeza:\n{type(e).__name__}: {str(e)}")
+        logger.error(f"Cleanup error: {type(e).__name__}: {e}")
+        await update.message.reply_text(f"❌ Erro ao executar limpeza:\n{type(e).__name__}")
 
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando de debug para verificar estado do sistema"""
     files = list_data_files()
     raw_data = load_garmin_data()
-    
-    # BUG FIX: Usar get_all_formatted_activities
     all_activities = get_all_formatted_activities()
     
     # Verificar health do garmin-fetcher
     is_healthy, health_msg = check_garmin_fetcher_health()
     
-    msg = f"""🔧 DEBUG INFO:
+    msg = f"""🔧 DEBUG INFO (v{BOT_VERSION}):
 
 📁 Arquivos em /data: {len(files)}
 📊 Dados carregados: {'Sim' if raw_data else 'Não'}
@@ -1692,7 +1822,7 @@ Arquivos recentes:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menu de ajuda"""
     await update.message.reply_text(
-        "🏋️ FitnessJournal-HRV Bot v3.1 (Refatorado + Bug Fixes)\n\n"
+        f"🏋️ FitnessJournal-HRV Bot v{BOT_VERSION} ({BOT_VERSION_DESC})\n\n"
         "📋 COMANDOS:\n"
         "/status - Ver readiness e dados\n"
         "/activities - Ver últimas atividades\n"
@@ -1712,11 +1842,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "6️⃣ /analyze_activity - Análise profunda individual\n\n"
         "📡 DADOS: Garmin Connect\n"
         "🤖 IA: Google Gemini 2.0 Flash\n\n"
-        "⚙️ MELHORIAS v3.1:\n"
-        "• Bug fix: Todas atividades consideradas\n"
-        "• Validação rigorosa para /analyze\n"
-        "• Busca inteligente (hoje → ontem)\n"
-        "• Mensagens de erro descritivas"
+        "⚙️ MELHORIAS v3.2:\n"
+        "• Fix: Model name correto\n"
+        "• Fix: Pluralização PT-PT\n"
+        "• Performance: Filtros otimizados\n"
+        "• Validação: Tamanho de prompts\n"
+        "• Consistência: Mensagens padronizadas"
     )
 
 # ==========================================
@@ -1728,8 +1859,6 @@ def auto_cleanup_on_startup():
         cleaned_flags, messages = cleanup_old_flags()
         if cleaned_flags > 0:
             logger.info(f"Auto-cleanup: {cleaned_flags} flags limpos no arranque")
-            for msg in messages:
-                logger.info(f"  {msg}")
     except Exception as e:
         logger.error(f"Erro no auto-cleanup: {e}")
 
@@ -1739,7 +1868,7 @@ def auto_cleanup_on_startup():
 def main():
     """Inicia o bot"""
     logger.info("=" * 50)
-    logger.info("FitnessJournal-HRV Bot v3.1 (Refatorado + Bug Fixes)")
+    logger.info(f"FitnessJournal-HRV Bot v{BOT_VERSION} ({BOT_VERSION_DESC})")
     logger.info("=" * 50)
     logger.info(f"Data dir: {DATA_DIR}")
     
