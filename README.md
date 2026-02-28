@@ -54,12 +54,10 @@ O bot utiliza a pasta `/data` para persistência. Certifica-te de que o volume e
 ├── context_user_id.json  # Persistência de conversas (Novo v3.4)
 └── analytics.json        # Métricas de uso (Novo v3.4)
 ```
----
-```markdown
-## 2. 📦 Configuração Técnica / Technical Setup
 
-### Docker Compose (Recomendado)
-```yaml
+📦 Configuração Técnica / Technical Setup
+Docker Compose (Recomendado)
+
 version: '3.8'
 services:
   fitness-bot:
@@ -90,7 +88,7 @@ services:
 | `/clear_context` | Limpa a memória de curto prazo (Follow-up) | v3.4 |
 | `/stats` | Analytics de perguntas e interações | v3.4 |
 | `/cleanup` | Limpa flags pendentes e organiza JSONs | v2.5 |
-
+```
 ---
     
 ❓ FAQ (Perguntas Frequentes)
