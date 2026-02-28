@@ -54,7 +54,8 @@ O bot utiliza a pasta `/data` para persistência. Certifica-te de que o volume e
 ├── context_user_id.json  # Persistência de conversas (Novo v3.4)
 └── analytics.json        # Métricas de uso (Novo v3.4)
 ```
-
+---
+```markdown
 📦 Configuração Técnica / Technical Setup
 Docker Compose (Recomendado)
 
@@ -72,7 +73,7 @@ services:
       - GARMIN_PASSWORD=your_password
       - GEMINI_MAX_PROMPT_LENGTH=8000 # Proteção contra overflow
     restart: always
-
+```
 ---
 
 ### 3. Tabela de Comandos e FAQ
