@@ -117,8 +117,10 @@ EN: How do I clear pending requests?
 
     Use the /cleanup command to clear old flags and reorganize activity history.
     
-    
-    # Changelog
+```
+---    
+
+# Changelog
 
 ## [3.4.0] - 2026-02-28
 
