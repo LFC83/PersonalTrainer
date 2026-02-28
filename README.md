@@ -1,96 +1,38 @@
-# 🏋️ FitnessJournal-HRV Bot (v2.7)
+# 🏋️ FitnessJournal-HRV Bot (v3.5)
 
-[PT] Este projeto é um ecossistema inteligente que utiliza a API do **Google Gemini** para atuar como um treinador de elite. Ele lê os teus dados biométricos do **Garmin Connect** (HRV, RHR, Sono e Carga) e gera planos de treino personalizados em **Português Europeu**, ajustados ao teu material e estado de recuperação.
+[PT] Este projeto é um ecossistema inteligente que utiliza a API do **Google Gemini (2.0 Flash)** para atuar como um treinador de elite. Ele funde os teus dados biométricos do **Garmin Connect** (HRV, RHR, Sono e Carga) com o teu feedback subjetivo para gerar planos de treino e análises de performance em **Português Europeu**.
 
-[EN] This project is an intelligent ecosystem that uses the **Google Gemini API** to act as an elite coach. It reads your **Garmin Connect** biometric data (HRV, RHR, Sleep, and Load) and generates personalized workout plans in **European Portuguese**, tailored to your equipment and recovery state.
+[EN] An intelligent ecosystem using **Google Gemini 2.0 Flash** to act as an elite performance coach. It merges **Garmin Connect** biometrics with user feedback to generate personalized workout plans and activity analysis in **European Portuguese**.
 
 ---
 
 ## 🇵🇹 Guia em Português
 
-### 🚀 Funcionalidades
-* **Análise de Readiness:** Avalia se estás apto para treinar com base na variabilidade da frequência cardíaca (HRV) e batimento em repouso (RHR).
-* **Planos Adaptativos:** Gera treinos de ginásio ou ciclismo considerando o teu equipamento disponível.
-* **Análise de Aderência:** Compara o plano sugerido com o que realmente executaste nas últimas sessões.
-* **Análise de Carga (Cargo Bike):** Cálculo específico de esforço para quem transporta carga ou passageiros (ex: 150kg total).
+### 🚀 Novas Funcionalidades (v3.0 a v3.5)
+* **💬 Perguntas de Seguimento (Follow-Up):** Agora podes responder às análises do bot para tirar dúvidas. O bot mantém o contexto da conversa por 15 minutos.
+* **💾 Persistência em Disco:** O contexto das tuas conversas e análises agora sobrevive a restarts do servidor ou do contentor Docker.
+* **🚴 Ciclismo Avançado:** Lógica de análise expandida para diferenciar **Spinning, MTB, Commute e Estrada**, com cálculos específicos para carga/passageiros.
+* **📊 Analytics de Utilização:** Comando `/stats` para visualizar tendências de perguntas e métricas de interação.
+* **📜 Histórico de Análises:** Acesso rápido às últimas 5 análises realizadas através do comando `/history`.
 
 ### 🛠️ Configuração e Personalização
 
 #### 1. Obter as Chaves (Tokens)
-* **Google Gemini API:** Acede ao [Google AI Studio](https://aistudio.google.com/), cria uma chave em "Get API key" e guarda-a.
-* **Telegram Bot:** Fala com o [@BotFather](https://t.me/botfather) no Telegram, usa `/newbot` e guarda o **API TOKEN** fornecido.
+* **Google Gemini API:** Obtenha a sua chave no [Google AI Studio](https://aistudio.google.com/).
+* **Telegram Bot:** Crie o seu bot com o [@BotFather](https://t.me/botfather) no Telegram.
 
 #### 2. Personalização do Código (`main.py`)
-* **3.1 Equipamento de Ginásio:** Localiza a variável `EQUIPAMENTOS_GIM` na linha 81 e altera a lista para o material que tens disponível (ex: "Halteres 10kg", "Elásticos").
-* **3.2 O Prompt do Sistema:** A variável `SYSTEM_PROMPT` (linhas 23-66) define a personalidade do treinador e as regras de cálculo. Podes ajustar o tom ou o foco nesta secção.
+* **Equipamento:** Altere a lista `EQUIPAMENTOS_GIM` para refletir o que tem disponível.
+* **Prompt do Sistema:** O `SYSTEM_PROMPT` define o "Protocolo de Verdade", garantindo rigor científico nas análises.
 
-#### 3. Estrutura de Pastas e Docker
-* **4. Organização:** O bot precisa de comunicar com os ficheiros JSON na pasta `/data`. A estrutura deve ser:
-    ```text
-    /projeto
-    ├── main.py
-    ├── Dockerfile
-    ├── requirements.txt
-    ├── docker-compose.yml
-    └── /data (Onde os JSONs do Garmin são guardados)
-    ```
-
----
-
-## 🇬🇧 English Guide
-
-### 🚀 Features
-* **Readiness Analysis:** Evaluates training readiness based on HRV and RHR.
-* **Adaptive Plans:** Generates workouts considering your specific gym equipment.
-* **Adherence Analysis:** Compares the suggested coach plan with actual Garmin activities.
-* **Cargo Bike Analysis:** Specialized effort calculation for heavy loads (e.g., 150kg total).
-
-### 🛠️ Setup and Customization
-
-#### 1. Obtain Tokens
-* **Google Gemini API:** Visit [Google AI Studio](https://aistudio.google.com/), create a key under "Get API key" and save it.
-* **Telegram Bot:** Message [@BotFather](https://t.me/botfather) on Telegram, use `/newbot` and save the provided **API TOKEN**.
-
-#### 2. Code Customization (`main.py`)
-* **3.1 Gym Equipment:** Locate the `EQUIPAMENTOS_GIM` variable (line 81) and edit the list to match your gear.
-* **3.2 System Prompt:** The `SYSTEM_PROMPT` variable (lines 23-66) defines the coach's personality and rules.
-
----
-
-## 📦 Configuração Técnica / Technical Setup
-
-### requirements.txt
+#### 3. Estrutura de Dados (Docker)
+O bot utiliza a pasta `/data` para persistência. Estrutura de ficheiros:
 ```text
-python-telegram-bot==20.8
-google-generativeai==0.3.2
-
-
-Dockerfile
-
-FROM python:3.10-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY main.py .
-RUN mkdir -p /data
-CMD ["python", "main.py"]
-
-Docker-compose
-
-version: '3.8'
-services:
-  fitness-bot:
-    build: .
-    container_name: fitness-journal-bot
-    volumes:
-      - ./data:/data
-    environment:
-      - TELEGRAM_TOKEN=YOUR_TELEGRAM_TOKEN
-      - GEMINI_API_KEY=YOUR_GEMINI_KEY
-      - GARMIN_EMAIL=your_email@garmin.com
-      - GARMIN_PASSWORD=your_password
-    restart: always
-    
+/data
+├── activities.json       # Histórico de atividades Garmin
+├── health_data.json      # Métricas biométricas (HRV, Sono, etc)
+├── context_user_id.json  # Persistência de conversas (v3.4+)
+└── analytics.json        # Métricas de uso (v3.4+)
     
     ❓ FAQ (Perguntas Frequentes)
 
