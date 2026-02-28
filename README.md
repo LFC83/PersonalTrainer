@@ -1,40 +1,97 @@
-# 🏋️ FitnessJournal-HRV Bot (v3.5)
+🏋️ FitnessJournal-HRV Bot (v3.5)
 
-[PT] Este projeto é um ecossistema inteligente que utiliza a API do **Google Gemini (2.0 Flash)** para atuar como um treinador de elite. Ele funde os teus dados biométricos do **Garmin Connect** (HRV, RHR, Sono e Carga) com o teu feedback subjetivo para gerar planos de treino e análises de performance em **Português Europeu**.
+[PT] Este projeto é um ecossistema inteligente que utiliza a API do Google Gemini (2.0 Flash) para atuar como um treinador de elite. Ele funde os teus dados biométricos do Garmin Connect (HRV, RHR, Sono e Carga) com o teu feedback subjetivo para gerar planos de treino e análises de performance em Português Europeu.
 
-[EN] An intelligent ecosystem using **Google Gemini 2.0 Flash** to act as an elite performance coach. It merges **Garmin Connect** biometrics with user feedback to generate personalized workout plans and activity analysis in **European Portuguese**.
+[EN] An intelligent ecosystem using Google Gemini 2.0 Flash to act as an elite performance coach. It merges Garmin Connect biometrics with user feedback to generate personalized workout plans and activity analysis in European Portuguese.
 
----
+🇵🇹 Guia em Português
+🚀 Novas Funcionalidades (v3.0 a v3.5)
 
-## 🇵🇹 Guia em Português
+    💬 Perguntas de Seguimento (Follow-Up): Agora podes responder às análises do bot para tirar dúvidas. O bot mantém o contexto da conversa por 15 minutos.
 
-### 🚀 Novas Funcionalidades (v3.0 a v3.5)
-* **💬 Perguntas de Seguimento (Follow-Up):** Agora podes responder às análises do bot para tirar dúvidas. O bot mantém o contexto da conversa por 15 minutos.
-* **💾 Persistência em Disco:** O contexto das tuas conversas e análises agora sobrevive a restarts do servidor ou do contentor Docker.
-* **🚴 Ciclismo Avançado:** Lógica de análise expandida para diferenciar **Spinning, MTB, Commute e Estrada**, com cálculos específicos para carga/passageiros.
-* **📊 Analytics de Utilização:** Comando `/stats` para visualizar tendências de perguntas e métricas de interação.
-* **📜 Histórico de Análises:** Acesso rápido às últimas 5 análises realizadas através do comando `/history`.
+    💾 Persistência em Disco: O contexto das tuas conversas e análises agora sobrevive a restarts do servidor ou do contentor Docker.
 
-### 🛠️ Configuração e Personalização
+    🚴 Ciclismo Avançado: Lógica de análise expandida para diferenciar Spinning, MTB, Commute e Estrada, com cálculos específicos para carga/passageiros.
 
-#### 1. Obter as Chaves (Tokens)
-* **Google Gemini API:** Obtenha a sua chave no [Google AI Studio](https://aistudio.google.com/).
-* **Telegram Bot:** Crie o seu bot com o [@BotFather](https://t.me/botfather) no Telegram.
+    📊 Analytics de Utilização: Comando /stats para visualizar tendências de perguntas e métricas de interação.
 
-#### 2. Personalização do Código (`main.py`)
-* **Equipamento:** Altere a lista `EQUIPAMENTOS_GIM` para refletir o que tem disponível.
-* **Prompt do Sistema:** O `SYSTEM_PROMPT` define o "Protocolo de Verdade", garantindo rigor científico nas análises.
+    📜 Histórico de Análises: Acesso rápido às últimas 5 análises realizadas através do comando /history.
 
-#### 3. Estrutura de Dados (Docker)
-O bot utiliza a pasta `/data` para persistência. Estrutura de ficheiros:
-```text
+🛠️ Configuração e Personalização
+1. Obter as Chaves (Tokens)
+
+    Google Gemini API: Obtenha a sua chave no Google AI Studio. O bot está otimizado para o modelo gemini-2.0-flash-exp.
+
+    Telegram Bot: Crie o seu bot com o @BotFather e obtenha o API TOKEN.
+
+2. Personalização do Código (main.py)
+
+    Equipamento: Altere a lista EQUIPAMENTOS_GIM para refletir o que tem em casa ou no ginásio.
+
+    Prompt do Sistema: O SYSTEM_PROMPT define o "Protocolo de Verdade". Ele obriga o bot a ser rigoroso e a nunca ignorar dados de HRV baixo.
+
+3. Estrutura de Dados (Docker)
+
+O bot utiliza a pasta /data para persistência. Certifica-te de que o volume está corretamente montado:
+Plaintext
+
 /data
 ├── activities.json       # Histórico de atividades Garmin
 ├── health_data.json      # Métricas biométricas (HRV, Sono, etc)
-├── context_user_id.json  # Persistência de conversas (v3.4+)
-└── analytics.json        # Métricas de uso (v3.4+)
+├── context_user_id.json  # Persistência de conversas (Novo v3.4)
+└── analytics.json        # Métricas de uso (Novo v3.4)
+
+🇬🇧 English Guide (Quick Specs)
+🚀 Key Features
+
+    Contextual Memory: Follow-up questions are now supported. The coach remembers the last analysis for 15 minutes.
+
+    Disk Persistence: Conversation context is saved to disk, ensuring stability during updates/restarts.
+
+    Multi-Activity Analysis: /analyze now processes all daily activities (up to 5) for a holistic view.
+
+    Safety First: Automatic Markdown escaping and fallback to plain text to prevent message delivery failures.
+
+📦 Configuração Técnica / Technical Setup
+Docker Compose (Recomendado)
+YAML
+
+version: '3.8'
+services:
+  fitness-bot:
+    build: .
+    container_name: fitness-journal-bot
+    volumes:
+      - ./data:/data
+    environment:
+      - TELEGRAM_TOKEN=your_token
+      - GEMINI_API_KEY=your_key
+      - GARMIN_EMAIL=your_email
+      - GARMIN_PASSWORD=your_password
+      - GEMINI_MAX_PROMPT_LENGTH=8000 # Proteção contra overflow
+    restart: always
+
+🎮 Comandos Principais (Changelog v3.5)
+Comando	Descrição	Versão
+/start	Inicia o bot e restaura contexto do disco	v3.4
+/analyze	Analisa todas as atividades de hoje/ontem	v3.2
+/activity	Menu interativo para analisar uma atividade específica	v3.0
+/history	Lista as últimas 5 análises guardadas	v3.4
+/clear_context	Limpa a memória de curto prazo (Follow-up)	v3.4
+/stats	Analytics de perguntas e interações	v3.4
+/cleanup	Limpa flags pendentes e organiza JSONs	v2.5
+
+🐛 Correções de Estabilidade (Bug Fixes)
+
+    Markdown Parsing: Implementada a função send_safe_message para evitar erros BadRequest quando o Gemini gera caracteres especiais (_, *, [).
+
+    Syntax Errors: Corrigida a f-string corrompida no comando start() da v3.4.0.
+
+    Truncation: Análises muito longas são agora truncadas de forma inteligente, preservando o início (análise) e o fim (conclusão).
+
+    Race Conditions: Implementado o Atomic Write Pattern para evitar corrupção de ficheiros JSON durante escritas simultâneas.
     
-    ❓ FAQ (Perguntas Frequentes)
+❓ FAQ (Perguntas Frequentes)
 
 PT: O bot diz que não tem dados de hoje.
 
