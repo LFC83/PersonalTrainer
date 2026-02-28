@@ -1,81 +1,59 @@
-# 🏋️ FitnessJournal-HRV Bot (v2.7)
+🏋️ FitnessJournal-HRV Bot (v3.5)
 
-[PT] Este projeto é um ecossistema inteligente que utiliza a API do **Google Gemini** para atuar como um treinador de elite. Ele lê os teus dados biométricos do **Garmin Connect** (HRV, RHR, Sono e Carga) e gera planos de treino personalizados em **Português Europeu**, ajustados ao teu material e estado de recuperação.
+[PT] Este projeto é um ecossistema inteligente que utiliza a API do Google Gemini (2.0 Flash) para atuar como um treinador de elite. Ele funde os teus dados biométricos do Garmin Connect (HRV, RHR, Sono e Carga) com o teu feedback subjetivo para gerar planos de treino e análises de performance em Português Europeu.
 
-[EN] This project is an intelligent ecosystem that uses the **Google Gemini API** to act as an elite coach. It reads your **Garmin Connect** biometric data (HRV, RHR, Sleep, and Load) and generates personalized workout plans in **European Portuguese**, tailored to your equipment and recovery state.
+[EN] An intelligent ecosystem using Google Gemini 2.0 Flash to act as an elite performance coach. It merges Garmin Connect biometrics with user feedback to generate personalized workout plans and activity analysis in European Portuguese.
+🇵🇹 Guia em Português
+🚀 Novas Funcionalidades (v3.0 a v3.5)
 
----
+    💬 Perguntas de Seguimento (Follow-Up): Agora podes responder às análises do bot para tirar dúvidas. O bot mantém o contexto da conversa por 15 minutos.
 
-## 🇵🇹 Guia em Português
+    💾 Persistência em Disco: O contexto das tuas conversas e análises agora sobrevive a restarts do servidor ou do contentor Docker.
 
-### 🚀 Funcionalidades
-* **Análise de Readiness:** Avalia se estás apto para treinar com base na variabilidade da frequência cardíaca (HRV) e batimento em repouso (RHR).
-* **Planos Adaptativos:** Gera treinos de ginásio ou ciclismo considerando o teu equipamento disponível.
-* **Análise de Aderência:** Compara o plano sugerido com o que realmente executaste nas últimas sessões.
-* **Análise de Carga (Cargo Bike):** Cálculo específico de esforço para quem transporta carga ou passageiros (ex: 150kg total).
+    🚴 Ciclismo Avançado: Lógica de análise expandida para diferenciar Spinning, MTB, Commute e Estrada, com cálculos específicos para carga/passageiros.
 
-### 🛠️ Configuração e Personalização
+    📊 Analytics de Utilização: Comando /stats para visualizar tendências de perguntas e métricas de interação.
 
-#### 1. Obter as Chaves (Tokens)
-* **Google Gemini API:** Acede ao [Google AI Studio](https://aistudio.google.com/), cria uma chave em "Get API key" e guarda-a.
-* **Telegram Bot:** Fala com o [@BotFather](https://t.me/botfather) no Telegram, usa `/newbot` e guarda o **API TOKEN** fornecido.
+    📜 Histórico de Análises: Acesso rápido às últimas 5 análises realizadas através do comando /history.
 
-#### 2. Personalização do Código (`main.py`)
-* **3.1 Equipamento de Ginásio:** Localiza a variável `EQUIPAMENTOS_GIM` na linha 81 e altera a lista para o material que tens disponível (ex: "Halteres 10kg", "Elásticos").
-* **3.2 O Prompt do Sistema:** A variável `SYSTEM_PROMPT` (linhas 23-66) define a personalidade do treinador e as regras de cálculo. Podes ajustar o tom ou o foco nesta secção.
+🛠️ Configuração e Personalização
+1. Obter as Chaves (Tokens)
 
-#### 3. Estrutura de Pastas e Docker
-* **4. Organização:** O bot precisa de comunicar com os ficheiros JSON na pasta `/data`. A estrutura deve ser:
-    ```text
-    /projeto
-    ├── main.py
-    ├── Dockerfile
-    ├── requirements.txt
-    ├── docker-compose.yml
-    └── /data (Onde os JSONs do Garmin são guardados)
-    ```
+    Google Gemini API: Obtenha a sua chave no Google AI Studio. O bot está otimizado para o modelo gemini-2.0-flash-exp.
 
----
+    Telegram Bot: Crie o seu bot com o @BotFather e obtenha o API TOKEN.
 
-## 🇬🇧 English Guide
+2. Personalização do Código (main.py)
 
-### 🚀 Features
-* **Readiness Analysis:** Evaluates training readiness based on HRV and RHR.
-* **Adaptive Plans:** Generates workouts considering your specific gym equipment.
-* **Adherence Analysis:** Compares the suggested coach plan with actual Garmin activities.
-* **Cargo Bike Analysis:** Specialized effort calculation for heavy loads (e.g., 150kg total).
+    Equipamento: Altere a lista EQUIPAMENTOS_GIM para refletir o que tem em casa ou no ginásio.
 
-### 🛠️ Setup and Customization
+    Prompt do Sistema: O SYSTEM_PROMPT define o "Protocolo de Verdade". Ele obriga o bot a ser rigoroso e a nunca ignorar dados de HRV baixo.
 
-#### 1. Obtain Tokens
-* **Google Gemini API:** Visit [Google AI Studio](https://aistudio.google.com/), create a key under "Get API key" and save it.
-* **Telegram Bot:** Message [@BotFather](https://t.me/botfather) on Telegram, use `/newbot` and save the provided **API TOKEN**.
+3. Estrutura de Dados (Docker)
 
-#### 2. Code Customization (`main.py`)
-* **3.1 Gym Equipment:** Locate the `EQUIPAMENTOS_GIM` variable (line 81) and edit the list to match your gear.
-* **3.2 System Prompt:** The `SYSTEM_PROMPT` variable (lines 23-66) defines the coach's personality and rules.
+O bot utiliza a pasta /data para persistência. Certifica-te de que o volume está corretamente montado:
+Plaintext
 
----
+/data
+├── activities.json       # Histórico de atividades Garmin
+├── health_data.json      # Métricas biométricas (HRV, Sono, etc)
+├── context_user_id.json  # Persistência de conversas (Novo v3.4)
+└── analytics.json        # Métricas de uso (Novo v3.4)
 
-## 📦 Configuração Técnica / Technical Setup
+🇬🇧 English Guide (Quick Specs)
+🚀 Key Features
 
-### requirements.txt
-```text
-python-telegram-bot==20.8
-google-generativeai==0.3.2
+    Contextual Memory: Follow-up questions are now supported. The coach remembers the last analysis for 15 minutes.
 
+    Disk Persistence: Conversation context is saved to disk, ensuring stability during updates/restarts.
 
-Dockerfile
+    Multi-Activity Analysis: /analyze now processes all daily activities (up to 5) for a holistic view.
 
-FROM python:3.10-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY main.py .
-RUN mkdir -p /data
-CMD ["python", "main.py"]
+    Safety First: Automatic Markdown escaping and fallback to plain text to prevent message delivery failures.
 
-Docker-compose
+📦 Configuração Técnica / Technical Setup
+Docker Compose (Recomendado)
+YAML
 
 version: '3.8'
 services:
@@ -85,38 +63,43 @@ services:
     volumes:
       - ./data:/data
     environment:
-      - TELEGRAM_TOKEN=YOUR_TELEGRAM_TOKEN
-      - GEMINI_API_KEY=YOUR_GEMINI_KEY
-      - GARMIN_EMAIL=your_email@garmin.com
+      - TELEGRAM_TOKEN=your_token
+      - GEMINI_API_KEY=your_key
+      - GARMIN_EMAIL=your_email
       - GARMIN_PASSWORD=your_password
+      - GEMINI_MAX_PROMPT_LENGTH=8000 # Proteção contra overflow
     restart: always
-    
-    
-    ❓ FAQ (Perguntas Frequentes)
 
-PT: O bot diz que não tem dados de hoje.
+🎮 Comandos Principais (Changelog v3.5)
+Comando	Descrição	Versão
+/start	Inicia o bot e restaura contexto do disco	v3.4
+/analyze	Analisa todas as atividades de hoje/ontem	v3.2
+/activity	Menu interativo para analisar uma atividade específica	v3.0
+/history	Lista as últimas 5 análises guardadas	v3.4
+/clear_context	Limpa a memória de curto prazo (Follow-up)	v3.4
+/stats	Analytics de perguntas e interações	v3.4
+/cleanup	Limpa flags pendentes e organiza JSONs	v2.5
+🐛 Correções de Estabilidade (Bug Fixes)
 
-    Usa o comando /sync para forçar uma sincronização. O bot cria um pedido que será processado pelo fetcher em ~60s.
+    Markdown Parsing: Implementada a função send_safe_message para evitar erros BadRequest quando o Gemini gera caracteres especiais (_, *, [).
 
-EN: The bot says today's data is empty.
+    Syntax Errors: Corrigida a f-string corrompida no comando start() da v3.4.0.
 
-    Use the /sync command to force a synchronization. The bot creates a request that will be processed in ~60s.
+    Truncation: Análises muito longas são agora truncadas de forma inteligente, preservando o início (análise) e o fim (conclusão).
 
-PT: Posso analisar um treino antigo?
+    Race Conditions: Implementado o Atomic Write Pattern para evitar corrupção de ficheiros JSON durante escritas simultâneas.
 
-    Sim, usa /analyze_activity e seleciona uma das últimas 5 atividades para uma análise profunda.
+❓ FAQ (Perguntas Frequentes)
 
-EN: Can I analyze an old workout?
+PT: O bot não responde às minhas perguntas de seguimento.
 
-    Yes, use /analyze_activity and select one of the last 5 activities for a deep analysis.
+    O contexto expira após 15 minutos de inatividade para garantir a precisão dos dados. O bot enviará um aviso quando restarem apenas 2 minutos de validade do contexto.
 
-PT: Como limpo pedidos pendentes?
+EN: How is the Cargo Bike effort calculated?
 
-    Usa o comando /cleanup para limpar flags antigas e reorganizar o histórico de atividades.
+    The system prompt includes a specific weight-to-effort ratio (e.g., 150kg total mass) to adjust the perceived exertion and recovery time suggested by the AI.
 
-EN: How do I clear pending requests?
-
-    Use the /cleanup command to clear old flags and reorganize activity history.
+Mantido por Luis Costa. Baseado no Protocolo de Performance v3.5.
     
     
     # Changelog
