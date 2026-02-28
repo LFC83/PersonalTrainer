@@ -52,10 +52,10 @@ Plaintext
 
     Safety First: Automatic Markdown escaping and fallback to plain text to prevent message delivery failures.
 
-📦 Configuração Técnica / Technical Setup
-Docker Compose (Recomendado)
-YAML
+## 📦 Configuração Técnica / Technical Setup
 
+### Docker Compose (Recomendado)
+```yaml
 version: '3.8'
 services:
   fitness-bot:
@@ -71,25 +71,15 @@ services:
       - GEMINI_MAX_PROMPT_LENGTH=8000 # Proteção contra overflow
     restart: always
 
-🎮 Comandos Principais (Changelog v3.5)
-Comando	Descrição	Versão
-/start	Inicia o bot e restaura contexto do disco	v3.4
-/analyze	Analisa todas as atividades de hoje/ontem	v3.2
-/activity	Menu interativo para analisar uma atividade específica	v3.0
-/history	Lista as últimas 5 análises guardadas	v3.4
-/clear_context	Limpa a memória de curto prazo (Follow-up)	v3.4
-/stats	Analytics de perguntas e interações	v3.4
-/cleanup	Limpa flags pendentes e organiza JSONs	v2.5
+Comando,Descrição,Versão
+/start,Inicia o bot e restaura contexto do disco,v3.4
+/analyze,Analisa todas as atividades de hoje/ontem,v3.2
+/activity,Menu interativo para analisar uma atividade específica,v3.0
+/history,Lista as últimas 5 análises guardadas,v3.4
+/clear_context,Limpa a memória de curto prazo (Follow-up),v3.4
+/stats,Analytics de perguntas e interações,v3.4
+/cleanup,Limpa flags pendentes e organiza JSONs,v2.5
 
-🐛 Correções de Estabilidade (Bug Fixes)
-
-    Markdown Parsing: Implementada a função send_safe_message para evitar erros BadRequest quando o Gemini gera caracteres especiais (_, *, [).
-
-    Syntax Errors: Corrigida a f-string corrompida no comando start() da v3.4.0.
-
-    Truncation: Análises muito longas são agora truncadas de forma inteligente, preservando o início (análise) e o fim (conclusão).
-
-    Race Conditions: Implementado o Atomic Write Pattern para evitar corrupção de ficheiros JSON durante escritas simultâneas.
     
 ❓ FAQ (Perguntas Frequentes)
 
