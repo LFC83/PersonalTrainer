@@ -45,7 +45,6 @@
 * **System Prompt:** The `SYSTEM_PROMPT` defines the "Truth Protocol". It forces the bot to be rigorous and never ignore low HRV data.
 
 #### 3. Estrutura de Dados (Docker)
-
 O bot utiliza a pasta `/data` para persistência. Certifica-te de que o volume está corretamente montado:
 
 ```text
@@ -56,6 +55,8 @@ O bot utiliza a pasta `/data` para persistência. Certifica-te de que o volume e
 └── analytics.json        # Métricas de uso (Novo v3.4)
 
 
+### 2. Configuração Técnica (Docker Compose)
+```markdown
 ## 📦 Configuração Técnica / Technical Setup
 
 ### Docker Compose (Recomendado)
@@ -73,17 +74,25 @@ services:
       - GARMIN_EMAIL=your_email
       - GARMIN_PASSWORD=your_password
       - GEMINI_MAX_PROMPT_LENGTH=8000 # Proteção contra overflow
-    restart: always```
+    restart: always
 
-Comando,Descrição,Versão
-/start,Inicia o bot e restaura contexto do disco,v3.4
-/analyze,Analisa todas as atividades de hoje/ontem,v3.2
-/activity,Menu interativo para analisar uma atividade específica,v3.0
-/history,Lista as últimas 5 análises guardadas,v3.4
-/clear_context,Limpa a memória de curto prazo (Follow-up),v3.4
-/stats,Analytics de perguntas e interações,v3.4
-/cleanup,Limpa flags pendentes e organiza JSONs,v2.5
+---
 
+### 3. Tabela de Comandos e FAQ
+```markdown
+### 🎮 Comandos Principais (Changelog v3.5)
+
+| Comando | Descrição | Versão |
+| :--- | :--- | :--- |
+| `/start` | Inicia o bot e restaura contexto do disco | v3.4 |
+| `/analyze` | Analisa todas as atividades de hoje/ontem | v3.2 |
+| `/activity` | Menu interativo para analisar atividade específica | v3.0 |
+| `/history` | Lista as últimas 5 análises guardadas | v3.4 |
+| `/clear_context` | Limpa a memória de curto prazo (Follow-up) | v3.4 |
+| `/stats` | Analytics de perguntas e interações | v3.4 |
+| `/cleanup` | Limpa flags pendentes e organiza JSONs | v2.5 |
+
+---
     
 ❓ FAQ (Perguntas Frequentes)
 
