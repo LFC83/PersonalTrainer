@@ -92,7 +92,7 @@ services:
 | `/stats` | Analytics de perguntas e interações | v3.4 |
 | `/cleanup` | Limpa flags pendentes e organiza JSONs | v2.5 |
 ```
----
+
     
 ❓ FAQ (Perguntas Frequentes)
 
@@ -120,7 +120,7 @@ EN: How do I clear pending requests?
 
     Use the /cleanup command to clear old flags and reorganize activity history.
     
-```  
+
 ---
 
 # Changelog
