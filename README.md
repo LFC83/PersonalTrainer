@@ -55,11 +55,13 @@ O bot utiliza a pasta `/data` para persistência. Certifica-te de que o volume e
 └── analytics.json        # Métricas de uso (Novo v3.4)
 ```
 ---
-```markdown
+
 📦 Configuração Técnica / Technical Setup
 Docker Compose (Recomendado)
 
+```text
 version: '3.8'
+
 services:
   fitness-bot:
     build: .
@@ -119,6 +121,7 @@ EN: How do I clear pending requests?
     Use the /cleanup command to clear old flags and reorganize activity history.
     
 ```  
+---
 
 # Changelog
 
