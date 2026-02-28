@@ -4,25 +4,26 @@
 
 [EN] An intelligent ecosystem using Google Gemini 2.0 Flash to act as an elite performance coach. It merges Garmin Connect biometrics with user feedback to generate personalized workout plans and activity analysis in European Portuguese.
 
-🇵🇹 Guia em Português
-🚀 Novas Funcionalidades (v3.0 a v3.5)
+## 🇵🇹 Guia em Português
 
-    💬 Perguntas de Seguimento (Follow-Up): Agora podes responder às análises do bot para tirar dúvidas. O bot mantém o contexto da conversa por 15 minutos.
-    💾 Persistência em Disco: O contexto das tuas conversas e análises agora sobrevive a restarts do servidor ou do contentor Docker.
-    🚴 Ciclismo Avançado: Lógica de análise expandida para diferenciar Spinning, MTB, Commute e Estrada, com cálculos específicos para carga/passageiros.
-    📊 Analytics de Utilização: Comando /stats para visualizar tendências de perguntas e métricas de interação.
-    📜 Histórico de Análises: Acesso rápido às últimas 5 análises realizadas através do comando /history.
+### 🚀 Novas Funcionalidades (v3.0 a v3.5)
+* **💬 Perguntas de Seguimento (Follow-Up):** Agora podes responder às análises do bot para tirar dúvidas. O bot mantém o contexto da conversa por 15 minutos.
+* **💾 Persistência em Disco:** O contexto das tuas conversas e análises agora sobrevive a restarts do servidor ou do contentor Docker via ficheiros JSON persistentes.
+* **🚴 Ciclismo Avançado:** Lógica de análise expandida para diferenciar entre **Spinning, MTB, Commute e Estrada**, incluindo cálculos específicos para carga/passageiros.
+* **📊 Analytics de Utilização:** Usa o comando `/stats` para visualizar tendências de perguntas e métricas de interação.
+* **📜 Histórico de Análises:** Acesso rápido às últimas 5 análises realizadas através do comando `/history`.
 
-🛠️ Configuração e Personalização
-1. Obter as Chaves (Tokens)
+### 🛠️ Configuração e Personalização
 
-    Google Gemini API: Obtenha a sua chave no Google AI Studio. O bot está otimizado para o modelo gemini-2.0-flash-exp.
-    Telegram Bot: Crie o seu bot com o @BotFather e obtenha o API TOKEN.
+#### 1. Obter as Chaves (Tokens)
+* **Google Gemini API:** Obtém a tua chave no [Google AI Studio](https://aistudio.google.com/). O bot está otimizado para o modelo `gemini-2.0-flash-exp`.
+* **Telegram Bot:** Cria o teu bot com o [@BotFather](https://t.me/botfather) e guarda o **API TOKEN** fornecido.
 
-2. Personalização do Código (main.py)
+#### 2. Personalização do Código (`main.py`)
+* **Equipamento:** Atualiza a lista `EQUIPAMENTOS_GIM` para refletir o material que tens em casa ou no teu ginásio.
+* **Prompt do Sistema:** O `SYSTEM_PROMPT` define o "Protocolo de Verdade". Ele obriga o bot a ser rigoroso e a nunca ignorar dados de HRV baixo.
 
-    Equipamento: Altere a lista EQUIPAMENTOS_GIM para refletir o que tem em casa ou no ginásio.
-    Prompt do Sistema: O SYSTEM_PROMPT define o "Protocolo de Verdade". Ele obriga o bot a ser rigoroso e a nunca ignorar dados de HRV baixo.
+---
 
 ## 🇬🇧 English Guide
 
@@ -44,6 +45,7 @@
 * **System Prompt:** The `SYSTEM_PROMPT` defines the "Truth Protocol". It forces the bot to be rigorous and never ignore low HRV data.
 
 #### 3. Estrutura de Dados (Docker)
+
 O bot utiliza a pasta `/data` para persistência. Certifica-te de que o volume está corretamente montado:
 
 ```text
@@ -71,7 +73,7 @@ services:
       - GARMIN_EMAIL=your_email
       - GARMIN_PASSWORD=your_password
       - GEMINI_MAX_PROMPT_LENGTH=8000 # Proteção contra overflow
-    restart: always
+    restart: always```
 
 Comando,Descrição,Versão
 /start,Inicia o bot e restaura contexto do disco,v3.4
