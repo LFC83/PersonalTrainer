@@ -8,49 +8,51 @@
 🚀 Novas Funcionalidades (v3.0 a v3.5)
 
     💬 Perguntas de Seguimento (Follow-Up): Agora podes responder às análises do bot para tirar dúvidas. O bot mantém o contexto da conversa por 15 minutos.
-
     💾 Persistência em Disco: O contexto das tuas conversas e análises agora sobrevive a restarts do servidor ou do contentor Docker.
-
     🚴 Ciclismo Avançado: Lógica de análise expandida para diferenciar Spinning, MTB, Commute e Estrada, com cálculos específicos para carga/passageiros.
-
     📊 Analytics de Utilização: Comando /stats para visualizar tendências de perguntas e métricas de interação.
-
     📜 Histórico de Análises: Acesso rápido às últimas 5 análises realizadas através do comando /history.
 
 🛠️ Configuração e Personalização
 1. Obter as Chaves (Tokens)
 
     Google Gemini API: Obtenha a sua chave no Google AI Studio. O bot está otimizado para o modelo gemini-2.0-flash-exp.
-
     Telegram Bot: Crie o seu bot com o @BotFather e obtenha o API TOKEN.
 
 2. Personalização do Código (main.py)
 
     Equipamento: Altere a lista EQUIPAMENTOS_GIM para refletir o que tem em casa ou no ginásio.
-
     Prompt do Sistema: O SYSTEM_PROMPT define o "Protocolo de Verdade". Ele obriga o bot a ser rigoroso e a nunca ignorar dados de HRV baixo.
 
-3. Estrutura de Dados (Docker)
+## 🇬🇧 English Guide
 
-O bot utiliza a pasta /data para persistência. Certifica-te de que o volume está corretamente montado:
-Plaintext
+### 🚀 New Features (v3.0 to v3.5)
+* **💬 Follow-Up Questions:** You can now reply directly to the bot's analysis to ask questions. The bot maintains conversation context for 15 minutes.
+* **💾 Disk Persistence:** Your conversation and analysis context now survives server restarts or Docker container reboots via persistent JSON files.
+* **🚴 Advanced Cycling:** Expanded analysis logic to differentiate between **Spinning, MTB, Commute, and Road cycling**, including specific load/passenger calculations.
+* **📊 Usage Analytics:** Use the `/stats` command to visualize question trends and interaction metrics.
+* **📜 Analysis History:** Quick access to the last 5 performed analyses through the `/history` command.
 
+### 🛠️ Setup and Customization
+
+#### 1. Obtain Tokens
+* **Google Gemini API:** Get your key at [Google AI Studio](https://aistudio.google.com/). The bot is optimized for the `gemini-2.0-flash-exp` model.
+* **Telegram Bot:** Create your bot with [@BotFather](https://t.me/botfather) and save the provided **API TOKEN**.
+
+#### 2. Code Customization (`main.py`)
+* **Equipment:** Update the `EQUIPAMENTOS_GIM` list to reflect the gear you have at home or in your gym.
+* **System Prompt:** The `SYSTEM_PROMPT` defines the "Truth Protocol". It forces the bot to be rigorous and never ignore low HRV data.
+
+#### 3. Estrutura de Dados (Docker)
+O bot utiliza a pasta `/data` para persistência. Certifica-te de que o volume está corretamente montado:
+
+```text
 /data
 ├── activities.json       # Histórico de atividades Garmin
 ├── health_data.json      # Métricas biométricas (HRV, Sono, etc)
 ├── context_user_id.json  # Persistência de conversas (Novo v3.4)
 └── analytics.json        # Métricas de uso (Novo v3.4)
 
-🇬🇧 English Guide (Quick Specs)
-🚀 Key Features
-
-    Contextual Memory: Follow-up questions are now supported. The coach remembers the last analysis for 15 minutes.
-
-    Disk Persistence: Conversation context is saved to disk, ensuring stability during updates/restarts.
-
-    Multi-Activity Analysis: /analyze now processes all daily activities (up to 5) for a holistic view.
-
-    Safety First: Automatic Markdown escaping and fallback to plain text to prevent message delivery failures.
 
 ## 📦 Configuração Técnica / Technical Setup
 
