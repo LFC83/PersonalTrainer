@@ -56,8 +56,8 @@ O bot utiliza a pasta `/data` para persistência. Certifica-te de que o volume e
 ```
 ---
 
-📦 Configuração Técnica / Technical Setup
-Docker Compose (Recomendado)
+### 📦 Configuração Técnica / Technical Setup
+### Docker Compose (Recomendado)
 
 ```text
 version: '3.8'
@@ -94,7 +94,7 @@ services:
 ```
 
     
-❓ FAQ (Perguntas Frequentes)
+### ❓ FAQ (Perguntas Frequentes)
 
 PT: O bot diz que não tem dados de hoje.
 
