@@ -53,11 +53,10 @@ O bot utiliza a pasta `/data` para persistência. Certifica-te de que o volume e
 ├── health_data.json      # Métricas biométricas (HRV, Sono, etc)
 ├── context_user_id.json  # Persistência de conversas (Novo v3.4)
 └── analytics.json        # Métricas de uso (Novo v3.4)
-
-
-### 2. Configuração Técnica (Docker Compose)
+```
+---
 ```markdown
-## 📦 Configuração Técnica / Technical Setup
+## 2. 📦 Configuração Técnica / Technical Setup
 
 ### Docker Compose (Recomendado)
 ```yaml
