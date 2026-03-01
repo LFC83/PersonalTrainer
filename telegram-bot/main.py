@@ -1,12 +1,16 @@
 import os, json, logging, traceback
+import asyncio
 from datetime import datetime, date, timedelta
 from dataclasses import dataclass, field, asdict
 from typing import Optional, List, Dict, Tuple, Any
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.error import BadRequest
 import google.generativeai as genai
 from statistics import mean
 import time
+import hashlib
+from collections import defaultdict
 
 # ==========================================
 # LOGGING SETUP
@@ -24,8 +28,8 @@ genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 logger.info("Gemini API configurada")
 
 # Bot Configuration
-BOT_VERSION = "3.4.0"
-BOT_VERSION_DESC = "Persistent Context + Cycling Types"
+BOT_VERSION = "3.6.0"
+BOT_VERSION_DESC = "Retry Logic + Circuit Breaker + Caching + Rate Limiting"
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 DATA_DIR = '/data'
 
@@ -50,20 +54,30 @@ TELEGRAM_SAFE_MESSAGE_LENGTH = 4000
 
 # Gemini API Limits
 GEMINI_MAX_PROMPT_LENGTH = 30000
-GEMINI_SAFE_PROMPT_LENGTH = 28000
+GEMINI_TIMEOUT_SECONDS = 30
 
-# Analysis Context (v3.3+)
-ENABLE_FOLLOWUP_QUESTIONS = True  # Feature flag
-ENABLE_FOLLOWUP_ANALYTICS = False  # Feature flag (v3.4)
-ANALYSIS_CONTEXT_TIMEOUT = 15  # Minutos até contexto expirar
-MAX_ANALYSIS_CONTEXT_LENGTH = 8000  # Chars para truncar análise anterior
-MAX_ANALYSIS_HISTORY = 5  # Máximo de análises no histórico
+# Context Management
+CONTEXT_TIMEOUT_MINUTES = 15
+MAX_CONTEXT_HISTORY = 3
 
-# Context Warning
-CONTEXT_WARNING_THRESHOLD = 13  # Avisar quando faltar 2min para expirar
+# Disk Space
+MIN_DISK_SPACE_MB = 10
 
-# Cycling Types (v3.4)
+# Cycling Types
 CYCLING_TYPES = ["Spinning", "MTB", "Commute", "Estrada"]
+
+# v3.6: Retry & Circuit Breaker
+MAX_RETRIES = 3
+RETRY_DELAYS = [2, 4, 8]  # seconds
+CIRCUIT_BREAKER_THRESHOLD = 5  # consecutive failures
+CIRCUIT_BREAKER_TIMEOUT = 60  # seconds
+
+# v3.6: Rate Limiting
+RATE_LIMIT_WINDOW = 60  # seconds
+RATE_LIMIT_MAX_REQUESTS = 10  # requests per window per user
+
+# v3.6: Cache
+RESPONSE_CACHE_SIZE = 100  # max cached responses
 
 # ==========================================
 # SYSTEM PROMPT
@@ -108,7 +122,7 @@ Operas sob o PROTOCOLO DE VERDADE. A tua diretiva primária é precisão e integ
 """
 
 model = genai.GenerativeModel(
-    model_name='gemini-2.0-flash-exp',
+    model_name='gemini-3-flash-preview',
     system_instruction=SYSTEM_PROMPT
 )
 
@@ -135,8 +149,20 @@ class PromptTooLargeError(Exception):
     """Prompt excede limites da API"""
     pass
 
-class ContextExpiredError(Exception):
-    """Contexto de análise expirou"""
+class GeminiTimeoutError(Exception):
+    """Timeout na chamada ao Gemini"""
+    pass
+
+class DiskSpaceError(Exception):
+    """Espaço em disco insuficiente"""
+    pass
+
+class CircuitBreakerOpen(Exception):
+    """Circuit breaker está aberto"""
+    pass
+
+class RateLimitExceeded(Exception):
+    """Rate limit excedido"""
     pass
 
 # ==========================================
@@ -229,7 +255,6 @@ class UserSessionState:
     selected_activity_index: Optional[int] = None
     awaiting_sync: bool = False
     retry_date: Optional[str] = None
-    awaiting_cycling_type: bool = False  # NEW v3.4
     
     def validate(self) -> Tuple[bool, str]:
         """Valida se o estado tem dados mínimos necessários"""
@@ -260,94 +285,474 @@ class UserSessionState:
         data['formatted_activities'] = [FormattedActivity(**a) for a in data['formatted_activities']]
         return cls(**data)
 
-@dataclass
-class AnalysisContext:
-    """
-    v3.3+: Contexto de uma análise anterior para follow-up questions.
-    v3.4: Agora persiste em disco
-    """
-    analysis_type: str  # 'adherence' ou 'individual'
-    original_prompt: str
-    analysis_result: str
-    timestamp: datetime
-    activity_date: Optional[str] = None
+# ==========================================
+# v3.6: CIRCUIT BREAKER
+# ==========================================
+class CircuitBreaker:
+    """Circuit breaker pattern para falhas do Gemini"""
     
-    def is_expired(self, timeout_minutes: int = ANALYSIS_CONTEXT_TIMEOUT) -> bool:
-        """Verifica se o contexto expirou"""
-        age = datetime.now() - self.timestamp
-        return age.total_seconds() > (timeout_minutes * 60)
+    def __init__(self):
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.state = 'closed'  # closed, open, half_open
     
-    def minutes_until_expiry(self, timeout_minutes: int = ANALYSIS_CONTEXT_TIMEOUT) -> float:
-        """Retorna minutos até expiração"""
-        age = datetime.now() - self.timestamp
-        elapsed_minutes = age.total_seconds() / 60
-        return max(0, timeout_minutes - elapsed_minutes)
+    def record_success(self):
+        """Registra sucesso"""
+        self.failure_count = 0
+        self.state = 'closed'
+        logger.info("Circuit breaker: success recorded, state=closed")
     
-    def validate(self) -> Tuple[bool, str]:
-        """Valida se o contexto tem dados mínimos"""
-        if not self.analysis_type or self.analysis_type not in ['adherence', 'individual']:
-            return False, "Tipo de análise inválido"
+    def record_failure(self):
+        """Registra falha"""
+        self.failure_count += 1
+        self.last_failure_time = time.time()
         
-        if not self.original_prompt or len(self.original_prompt) < 10:
-            return False, "Prompt original vazio ou inválido"
-        
-        if not self.analysis_result or len(self.analysis_result) < 10:
-            return False, "Resultado da análise vazio ou inválido"
-        
-        return True, ""
+        if self.failure_count >= CIRCUIT_BREAKER_THRESHOLD:
+            self.state = 'open'
+            logger.warning(f"Circuit breaker OPENED after {self.failure_count} failures")
+        else:
+            logger.info(f"Circuit breaker: failure {self.failure_count}/{CIRCUIT_BREAKER_THRESHOLD}")
     
-    def to_dict(self) -> Dict:
-        """Serializa para guardar em context.user_data ou disco"""
-        return {
-            'analysis_type': self.analysis_type,
-            'original_prompt': self.original_prompt,
-            'analysis_result': self.analysis_result,
-            'timestamp': self.timestamp.isoformat(),
-            'activity_date': self.activity_date
-        }
+    def is_open(self) -> bool:
+        """Verifica se circuit breaker está aberto"""
+        if self.state == 'closed':
+            return False
+        
+        if self.state == 'open':
+            # Check se deve tentar half-open
+            if self.last_failure_time:
+                elapsed = time.time() - self.last_failure_time
+                if elapsed > CIRCUIT_BREAKER_TIMEOUT:
+                    self.state = 'half_open'
+                    logger.info("Circuit breaker: transitioning to HALF_OPEN")
+                    return False
+            return True
+        
+        # half_open: permitir 1 tentativa
+        return False
     
-    @classmethod
-    def from_dict(cls, data: Dict) -> 'AnalysisContext':
-        """Deserializa de context.user_data ou disco"""
-        data['timestamp'] = datetime.fromisoformat(data['timestamp'])
-        return cls(**data)
+    def reset(self):
+        """Reset manual do circuit breaker"""
+        self.failure_count = 0
+        self.state = 'closed'
+        self.last_failure_time = None
+        logger.info("Circuit breaker: manually RESET")
 
-@dataclass
-class FollowUpAnalytics:
-    """v3.4: Analytics de perguntas follow-up"""
-    total_questions: int = 0
-    by_type: Dict[str, int] = field(default_factory=lambda: {'adherence': 0, 'individual': 0})
-    common_keywords: Dict[str, int] = field(default_factory=dict)
-    last_updated: Optional[str] = None
+# Global circuit breaker
+circuit_breaker = CircuitBreaker()
+
+# ==========================================
+# v3.6: RESPONSE CACHE
+# ==========================================
+class ResponseCache:
+    """Cache simples para respostas do Gemini"""
     
-    def record_question(self, analysis_type: str, question: str):
-        """Regista uma pergunta follow-up"""
-        self.total_questions += 1
-        self.by_type[analysis_type] = self.by_type.get(analysis_type, 0) + 1
+    def __init__(self, max_size: int = RESPONSE_CACHE_SIZE):
+        self.cache = {}
+        self.max_size = max_size
+        self.access_times = {}
+    
+    def _hash_prompt(self, prompt: str) -> str:
+        """Gera hash do prompt"""
+        return hashlib.sha256(prompt.encode()).hexdigest()
+    
+    def get(self, prompt: str) -> Optional[Tuple[str, float]]:
+        """Obtém resposta do cache se válida"""
+        cache_key = self._hash_prompt(prompt)
         
-        # Extrair keywords simples (palavras > 4 chars)
-        words = [w.lower() for w in question.split() if len(w) > 4]
-        for word in words[:5]:  # Limitar a 5 palavras
-            self.common_keywords[word] = self.common_keywords.get(word, 0) + 1
+        if cache_key not in self.cache:
+            return None
         
-        self.last_updated = datetime.now().isoformat()
+        response, timestamp = self.cache[cache_key]
+        age = time.time() - timestamp
+        
+        if age > CACHE_TTL_SECONDS:
+            # Cache expirado
+            del self.cache[cache_key]
+            if cache_key in self.access_times:
+                del self.access_times[cache_key]
+            return None
+        
+        logger.info(f"Cache HIT (age={age:.1f}s)")
+        self.access_times[cache_key] = time.time()
+        return response, age
     
-    def to_dict(self) -> Dict:
-        return asdict(self)
+    def set(self, prompt: str, response: str):
+        """Armazena resposta no cache"""
+        cache_key = self._hash_prompt(prompt)
+        
+        # LRU eviction se necessário
+        if len(self.cache) >= self.max_size:
+            # Remove entrada mais antiga
+            oldest_key = min(self.access_times.keys(), key=lambda k: self.access_times[k])
+            del self.cache[oldest_key]
+            del self.access_times[oldest_key]
+            logger.info(f"Cache EVICTION (size={len(self.cache)})")
+        
+        self.cache[cache_key] = (response, time.time())
+        self.access_times[cache_key] = time.time()
+        logger.info(f"Cache SET (size={len(self.cache)})")
     
-    @classmethod
-    def from_dict(cls, data: Dict) -> 'FollowUpAnalytics':
-        return cls(**data)
+    def clear(self):
+        """Limpa todo o cache"""
+        self.cache.clear()
+        self.access_times.clear()
+        logger.info("Cache CLEARED")
+
+# Global cache
+response_cache = ResponseCache()
+
+# ==========================================
+# v3.6: RATE LIMITER
+# ==========================================
+class RateLimiter:
+    """Rate limiter por usuário"""
+    
+    def __init__(self):
+        self.requests = defaultdict(list)  # user_id -> [timestamps]
+    
+    def check_rate_limit(self, user_id: int) -> Tuple[bool, int]:
+        """
+        Verifica se usuário está dentro do rate limit.
+        
+        Returns:
+            (is_allowed, requests_in_window)
+        """
+        now = time.time()
+        window_start = now - RATE_LIMIT_WINDOW
+        
+        # Limpar requisições antigas
+        self.requests[user_id] = [
+            ts for ts in self.requests[user_id]
+            if ts > window_start
+        ]
+        
+        current_count = len(self.requests[user_id])
+        
+        if current_count >= RATE_LIMIT_MAX_REQUESTS:
+            logger.warning(f"Rate limit EXCEEDED for user {user_id}: {current_count}/{RATE_LIMIT_MAX_REQUESTS}")
+            return False, current_count
+        
+        return True, current_count
+    
+    def record_request(self, user_id: int):
+        """Registra nova requisição"""
+        self.requests[user_id].append(time.time())
+    
+    def reset_user(self, user_id: int):
+        """Reset rate limit para usuário"""
+        if user_id in self.requests:
+            del self.requests[user_id]
+            logger.info(f"Rate limit RESET for user {user_id}")
+
+# Global rate limiter
+rate_limiter = RateLimiter()
+
+# ==========================================
+# UTILITY FUNCTIONS - VALIDATION
+# ==========================================
+def has_disk_space(path: str, min_mb: int = MIN_DISK_SPACE_MB) -> bool:
+    """
+    Verifica se há espaço em disco suficiente.
+    
+    Returns:
+        True se há espaço, False caso contrário
+    """
+    try:
+        stat = os.statvfs(os.path.dirname(path))
+        free_mb = (stat.f_bavail * stat.f_frsize) / (1024 ** 2)
+        return free_mb > min_mb
+    except Exception as e:
+        logger.warning(f"Failed to check disk space: {e}")
+        return True  # Assume OK se não conseguir verificar
+
+def validate_gemini_response(response: Any) -> Tuple[bool, str]:
+    """
+    Valida resposta do Gemini.
+    
+    Returns:
+        (is_valid, text_or_error_message)
+    """
+    if not response:
+        return False, "Resposta vazia do Gemini"
+    
+    if not hasattr(response, 'text'):
+        return False, "Resposta sem campo text"
+    
+    text = response.text
+    
+    if not text or len(text.strip()) < 10:
+        return False, "Resposta muito curta ou vazia"
+    
+    return True, text
+
+async def call_gemini_with_retry(prompt: str, timeout: int = GEMINI_TIMEOUT_SECONDS) -> Any:
+    """
+    v3.6: Chama Gemini com retry logic e exponential backoff.
+    
+    Raises:
+        CircuitBreakerOpen: Se circuit breaker estiver aberto
+        GeminiTimeoutError: Se timeout excedido após retries
+        Exception: Outros erros do Gemini
+    """
+    # Check circuit breaker
+    if circuit_breaker.is_open():
+        logger.error("Circuit breaker is OPEN, rejecting request")
+        raise CircuitBreakerOpen("Serviço temporariamente indisponível")
+    
+    # Check cache
+    cached = response_cache.get(prompt)
+    if cached:
+        response_text, cache_age = cached
+        logger.info(f"Using cached response (age={cache_age:.1f}s)")
+        
+        # Criar objeto mock com .text
+        class CachedResponse:
+            def __init__(self, text):
+                self.text = text
+        
+        circuit_breaker.record_success()
+        return CachedResponse(response_text)
+    
+    # Retry loop
+    for attempt in range(MAX_RETRIES):
+        try:
+            logger.info(f"Gemini API call attempt {attempt + 1}/{MAX_RETRIES}")
+            
+            response = await asyncio.wait_for(
+                asyncio.to_thread(model.generate_content, prompt),
+                timeout=timeout
+            )
+            
+            # Sucesso
+            circuit_breaker.record_success()
+            
+            # Cache response
+            if hasattr(response, 'text') and response.text:
+                response_cache.set(prompt, response.text)
+            
+            return response
+            
+        except asyncio.TimeoutError:
+            logger.error(f"Gemini timeout on attempt {attempt + 1}")
+            
+            if attempt < MAX_RETRIES - 1:
+                delay = RETRY_DELAYS[attempt]
+                logger.info(f"Retrying after {delay}s delay...")
+                await asyncio.sleep(delay)
+                continue
+            else:
+                circuit_breaker.record_failure()
+                raise GeminiTimeoutError(f"Gemini não respondeu em {timeout}s (após {MAX_RETRIES} tentativas)")
+        
+        except Exception as e:
+            logger.error(f"Gemini API error on attempt {attempt + 1}: {type(e).__name__}: {e}")
+            
+            if attempt < MAX_RETRIES - 1:
+                delay = RETRY_DELAYS[attempt]
+                logger.info(f"Retrying after {delay}s delay...")
+                await asyncio.sleep(delay)
+                continue
+            else:
+                circuit_breaker.record_failure()
+                raise
+
+# Manter compatibilidade com código antigo
+async def call_gemini_with_timeout(prompt: str, timeout: int = GEMINI_TIMEOUT_SECONDS) -> Any:
+    """Alias para call_gemini_with_retry (backward compatibility)"""
+    return await call_gemini_with_retry(prompt, timeout)
+
+# ==========================================
+# CONTEXT MANAGEMENT
+# ==========================================
+def get_context_path(user_id: int) -> str:
+    """Retorna path do arquivo de contexto para um user"""
+    return os.path.join(DATA_DIR, f'user_context_{user_id}.json')
+
+def save_context_to_disk(user_id: int, prompt: str, response: str, analysis_type: str = 'general') -> bool:
+    """
+    Salva contexto de análise em disco.
+    Atomic write + disk space check.
+    """
+    path = get_context_path(user_id)
+    temp_path = path + '.tmp'
+    
+    try:
+        # Verificar espaço em disco
+        if not has_disk_space(path):
+            logger.error(f"Insufficient disk space for user {user_id}")
+            raise DiskSpaceError("Espaço em disco insuficiente")
+        
+        # Carregar histórico existente
+        existing_data = load_context_from_disk(user_id) or {'history': []}
+        
+        # Adicionar nova entrada
+        new_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'analysis_type': analysis_type,
+            'prompt': prompt[:5000],
+            'response': response[:10000],
+        }
+        
+        history = existing_data.get('history', [])
+        history.append(new_entry)
+        
+        if len(history) > MAX_CONTEXT_HISTORY:
+            history = history[-MAX_CONTEXT_HISTORY:]
+        
+        context_data = {
+            'user_id': user_id,
+            'last_updated': datetime.now().isoformat(),
+            'current': new_entry,
+            'history': history
+        }
+        
+        # Atomic write
+        with open(temp_path, 'w', encoding='utf-8') as f:
+            json.dump(context_data, f, indent=2, ensure_ascii=False)
+        
+        os.replace(temp_path, path)
+        logger.info(f"Context saved for user {user_id}: {analysis_type}")
+        return True
+        
+    except DiskSpaceError:
+        logger.error(f"Disk space error for user {user_id}")
+        return False
+        
+    except Exception as e:
+        logger.error(f"Failed to save context for user {user_id}: {e}")
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+        return False
+
+def load_context_from_disk(user_id: int) -> Optional[Dict]:
+    """Carrega contexto do disco. Retorna None se não existir ou expirado."""
+    path = get_context_path(user_id)
+    
+    if not os.path.exists(path):
+        return None
+    
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # Verificar expiração
+        if 'current' in data:
+            timestamp_str = data['current'].get('timestamp')
+            if timestamp_str:
+                timestamp = datetime.fromisoformat(timestamp_str)
+                age_minutes = (datetime.now() - timestamp).total_seconds() / 60
+                
+                if age_minutes > CONTEXT_TIMEOUT_MINUTES:
+                    logger.info(f"Context expired for user {user_id} ({age_minutes:.1f}min)")
+                    return None
+        
+        logger.info(f"Context loaded for user {user_id}")
+        return data
+        
+    except Exception as e:
+        logger.error(f"Failed to load context for user {user_id}: {e}")
+        return None
+
+def clear_context_disk(user_id: int) -> bool:
+    """Remove contexto do disco"""
+    path = get_context_path(user_id)
+    
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            logger.info(f"Context cleared for user {user_id}")
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Failed to clear context for user {user_id}: {e}")
+        return False
+
+def get_context_stats() -> Dict:
+    """Retorna estatísticas agregadas de contextos"""
+    try:
+        stats = {
+            'total_users': 0,
+            'by_type': {},
+            'recent_activity': []
+        }
+        
+        for filename in os.listdir(DATA_DIR):
+            if filename.startswith('user_context_') and filename.endswith('.json'):
+                try:
+                    user_id = int(filename.replace('user_context_', '').replace('.json', ''))
+                    context_data = load_context_from_disk(user_id)
+                    
+                    if context_data:
+                        stats['total_users'] += 1
+                        
+                        for entry in context_data.get('history', []):
+                            analysis_type = entry.get('analysis_type', 'unknown')
+                            stats['by_type'][analysis_type] = stats['by_type'].get(analysis_type, 0) + 1
+                        
+                        if 'current' in context_data:
+                            stats['recent_activity'].append({
+                                'user_id': user_id,
+                                'timestamp': context_data['current'].get('timestamp'),
+                                'type': context_data['current'].get('analysis_type')
+                            })
+                
+                except (ValueError, TypeError):
+                    continue
+        
+        stats['recent_activity'] = sorted(
+            stats['recent_activity'], 
+            key=lambda x: x['timestamp'], 
+            reverse=True
+        )[:5]
+        
+        return stats
+        
+    except Exception as e:
+        logger.error(f"Failed to get context stats: {e}")
+        return {'error': str(e)}
+
+# ==========================================
+# SAFE TELEGRAM MESSAGING
+# ==========================================
+async def send_safe_message(update: Update, text: str, parse_mode: Optional[str] = None, **kwargs) -> bool:
+    """
+    Envia mensagem com fallback se Markdown falhar.
+    
+    Returns:
+        True se enviado com sucesso, False caso contrário
+    """
+    try:
+        await update.message.reply_text(text, parse_mode=parse_mode, **kwargs)
+        return True
+        
+    except BadRequest as e:
+        logger.warning(f"Markdown parse error: {e}. Retrying without formatting...")
+        
+        try:
+            await update.message.reply_text(text, **kwargs)
+            return True
+            
+        except Exception as retry_error:
+            logger.error(f"Failed to send message even without formatting: {retry_error}")
+            return False
+    
+    except Exception as e:
+        logger.error(f"Unexpected error sending message: {e}")
+        return False
 
 # ==========================================
 # UTILITY FUNCTIONS
 # ==========================================
 def pluralize_pt(count: int, singular: str, plural: str) -> str:
-    """Retorna forma correta (singular/plural) baseado na contagem"""
+    """Retorna forma correta (singular/plural)"""
     return plural if count != 1 else singular
 
 def format_found_activities_message(count: int, date: str, is_today: bool) -> str:
-    """Formata mensagem de atividades encontradas com pluralização correta"""
+    """Formata mensagem de atividades encontradas"""
     day_label = "hoje" if is_today else "ontem"
     
     if count == 1:
@@ -356,32 +761,13 @@ def format_found_activities_message(count: int, date: str, is_today: bool) -> st
         return f"✅ Encontradas {count} atividades de {day_label} ({date})"
 
 def truncate_text_safe(text: str, max_length: int, suffix: str = "...") -> str:
-    """Trunca texto de forma segura, adicionando sufixo se necessário"""
+    """Trunca texto de forma segura"""
     if len(text) <= max_length:
         return text
-    
     return text[:max_length - len(suffix)] + suffix
 
-def truncate_analysis_safe(analysis: str, max_length: int = MAX_ANALYSIS_CONTEXT_LENGTH) -> str:
-    """
-    v3.4: Helper dedicado para truncar análises longas.
-    Smart truncation: mantém início e fim (geralmente contêm o essencial).
-    """
-    if len(analysis) <= max_length:
-        return analysis
-    
-    keep_chars = max_length // 2
-    truncated = (
-        analysis[:keep_chars] + 
-        "\n\n[... análise truncada ...]\n\n" +
-        analysis[-keep_chars:]
-    )
-    
-    logger.info(f"Analysis truncated: {len(analysis)} → {len(truncated)} chars")
-    return truncated
-
 def split_long_message(text: str, max_length: int = TELEGRAM_SAFE_MESSAGE_LENGTH) -> List[str]:
-    """Divide mensagem longa em partes que cabem no limite do Telegram"""
+    """Divide mensagem longa em partes"""
     if len(text) <= max_length:
         return [text]
     
@@ -407,306 +793,11 @@ def split_long_message(text: str, max_length: int = TELEGRAM_SAFE_MESSAGE_LENGTH
     
     return parts
 
-def validate_prompt_size(prompt: str) -> Tuple[bool, str]:
-    """
-    v3.4: Valida se prompt cabe nos limites da API Gemini.
-    Retorna: (is_valid, error_message)
-    """
-    prompt_length = len(prompt)
-    
-    if prompt_length > GEMINI_MAX_PROMPT_LENGTH:
-        return False, f"Prompt demasiado longo: {prompt_length} chars (max: {GEMINI_MAX_PROMPT_LENGTH})"
-    
-    if prompt_length > GEMINI_SAFE_PROMPT_LENGTH:
-        logger.warning(f"Prompt próximo do limite: {prompt_length}/{GEMINI_MAX_PROMPT_LENGTH}")
-    
-    return True, ""
-
-# ==========================================
-# CONTEXT STORAGE (v3.4)
-# ==========================================
-def get_context_store_path(user_id: int) -> str:
-    """Retorna path do arquivo de contexto para um user"""
-    return os.path.join(DATA_DIR, f'context_store_{user_id}.json')
-
-def load_context_from_disk(user_id: int) -> Optional[Dict]:
-    """
-    v3.4: Carrega contexto persistido em disco.
-    Retorna dict com 'current_context' e 'history'.
-    """
-    path = get_context_store_path(user_id)
-    
-    if not os.path.exists(path):
-        logger.info(f"No context store found for user {user_id}")
-        return None
-    
-    try:
-        with open(path, 'r') as f:
-            data = json.load(f)
-        
-        logger.info(f"Loaded context from disk for user {user_id}")
-        return data
-        
-    except json.JSONDecodeError as e:
-        logger.error(f"Corrupted context store for user {user_id}: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Failed to load context for user {user_id}: {e}")
-        return None
-
-def save_context_to_disk(user_id: int, current_context: Optional[Dict], history: List[Dict]) -> bool:
-    """
-    v3.4: Persiste contexto em disco (atomic write).
-    """
-    path = get_context_store_path(user_id)
-    temp_path = path + '.tmp'
-    
-    try:
-        store = {
-            'user_id': user_id,
-            'current_context': current_context,
-            'history': history,
-            'last_updated': datetime.now().isoformat()
-        }
-        
-        with open(temp_path, 'w') as f:
-            json.dump(store, f, indent=2)
-        
-        os.replace(temp_path, path)
-        logger.info(f"Context saved to disk for user {user_id}")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Failed to save context for user {user_id}: {e}")
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        return False
-
-def clear_context_disk(user_id: int) -> bool:
-    """v3.4: Remove arquivo de contexto do disco"""
-    path = get_context_store_path(user_id)
-    
-    try:
-        if os.path.exists(path):
-            os.remove(path)
-            logger.info(f"Context store deleted for user {user_id}")
-            return True
-        return False
-    except Exception as e:
-        logger.error(f"Failed to delete context for user {user_id}: {e}")
-        return False
-
-def save_analysis_context(
-    context: ContextTypes.DEFAULT_TYPE,
-    analysis_type: str,
-    original_prompt: str,
-    analysis_result: str,
-    activity_date: Optional[str] = None
-) -> bool:
-    """
-    v3.3: Helper para guardar contexto de análise (DRY).
-    v3.4: Agora também persiste em disco e mantém histórico.
-    """
-    if not ENABLE_FOLLOWUP_QUESTIONS:
-        return False
-    
-    try:
-        user_id = context._user_id
-        
-        # Criar novo contexto
-        analysis_context = AnalysisContext(
-            analysis_type=analysis_type,
-            original_prompt=original_prompt,
-            analysis_result=analysis_result,
-            timestamp=datetime.now(),
-            activity_date=activity_date
-        )
-        
-        # Validar
-        is_valid, error_msg = analysis_context.validate()
-        if not is_valid:
-            logger.error(f"Invalid analysis context: {error_msg}")
-            return False
-        
-        # Guardar em memória (context.user_data)
-        context_dict = analysis_context.to_dict()
-        context.user_data['last_analysis_context'] = context_dict
-        
-        # Atualizar histórico (FIFO)
-        history = context.user_data.get('analysis_history', [])
-        history.append(context_dict)
-        
-        if len(history) > MAX_ANALYSIS_HISTORY:
-            history = history[-MAX_ANALYSIS_HISTORY:]
-        
-        context.user_data['analysis_history'] = history
-        
-        # Persistir em disco
-        save_context_to_disk(user_id, context_dict, history)
-        
-        # Analytics (opcional)
-        if ENABLE_FOLLOWUP_ANALYTICS:
-            record_analytics_event(user_id, 'analysis_created', analysis_type)
-        
-        logger.info(
-            f"Analysis context saved: type={analysis_type}, "
-            f"date={activity_date or 'N/A'}, "
-            f"history_size={len(history)}"
-        )
-        return True
-        
-    except Exception as e:
-        logger.error(f"Failed to save analysis context: {e}")
-        return False
-
-def load_analysis_context(context: ContextTypes.DEFAULT_TYPE) -> Optional[AnalysisContext]:
-    """
-    v3.4: Carrega contexto atual (memória ou disco).
-    Se não há em memória, tenta carregar do disco.
-    """
-    # Tentar memória primeiro
-    context_dict = context.user_data.get('last_analysis_context')
-    
-    if not context_dict:
-        # Tentar disco
-        user_id = context._user_id
-        disk_data = load_context_from_disk(user_id)
-        
-        if disk_data and disk_data.get('current_context'):
-            context_dict = disk_data['current_context']
-            context.user_data['last_analysis_context'] = context_dict
-            context.user_data['analysis_history'] = disk_data.get('history', [])
-            logger.info(f"Context restored from disk for user {user_id}")
-        else:
-            return None
-    
-    try:
-        analysis_ctx = AnalysisContext.from_dict(context_dict)
-        
-        # Verificar se expirou
-        if analysis_ctx.is_expired():
-            raise ContextExpiredError("Context expired")
-        
-        return analysis_ctx
-        
-    except ContextExpiredError:
-        logger.info("Analysis context expired")
-        context.user_data.pop('last_analysis_context', None)
-        return None
-    except Exception as e:
-        logger.error(f"Failed to load analysis context: {e}")
-        return None
-
-def build_followup_prompt(analysis_ctx: AnalysisContext, question: str) -> str:
-    """
-    v3.3: Constrói super-prompt para follow-up question.
-    v3.4: Agora com validação de tamanho e melhor error handling.
-    """
-    personality_reminder = """És um TREINADOR DE ELITE especializado em Ciclismo de Resistência e Hipertrofia.
-TOM: Assertivo, direto e orientado para resultados. Sem emojis.
-Usa PORTUGUÊS EUROPEU (PT-PT) EXCLUSIVAMENTE."""
-
-    analysis_type_label = (
-        "análise de aderência ao plano" 
-        if analysis_ctx.analysis_type == 'adherence' 
-        else "análise individual de atividade"
-    )
-    
-    # Truncar análise se necessário
-    analysis_result = truncate_analysis_safe(analysis_ctx.analysis_result)
-    
-    prompt = f"""{personality_reminder}
-
-CONTEXTO DA CONVERSA ANTERIOR:
-Fizeste uma {analysis_type_label}. Aqui está o que disseste:
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PROMPT ORIGINAL:
-{analysis_ctx.original_prompt}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-TUA ANÁLISE ANTERIOR:
-{analysis_result}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-O atleta tem agora uma DÚVIDA sobre a tua análise anterior:
-
-"{question}"
-
-TAREFA:
-Responde à dúvida do atleta de forma clara e direta.
-- Mantém o contexto da análise anterior.
-- Se necessário, refere pontos específicos que mencionaste.
-- Se a dúvida não estiver relacionada com a análise, informa o atleta educadamente.
-- Usa PORTUGUÊS EUROPEU sem LaTeX ou símbolos especiais.
-"""
-
-    # Validar tamanho
-    is_valid, error_msg = validate_prompt_size(prompt)
-    if not is_valid:
-        raise PromptTooLargeError(error_msg)
-
-    return prompt
-
-# ==========================================
-# ANALYTICS (v3.4)
-# ==========================================
-def get_analytics_path() -> str:
-    """Retorna path do arquivo de analytics"""
-    return os.path.join(DATA_DIR, 'followup_analytics.json')
-
-def load_analytics() -> FollowUpAnalytics:
-    """Carrega analytics do disco"""
-    path = get_analytics_path()
-    
-    if not os.path.exists(path):
-        return FollowUpAnalytics()
-    
-    try:
-        with open(path, 'r') as f:
-            data = json.load(f)
-        return FollowUpAnalytics.from_dict(data)
-    except Exception as e:
-        logger.error(f"Failed to load analytics: {e}")
-        return FollowUpAnalytics()
-
-def save_analytics(analytics: FollowUpAnalytics) -> bool:
-    """Salva analytics no disco"""
-    path = get_analytics_path()
-    temp_path = path + '.tmp'
-    
-    try:
-        with open(temp_path, 'w') as f:
-            json.dump(analytics.to_dict(), f, indent=2)
-        os.replace(temp_path, path)
-        return True
-    except Exception as e:
-        logger.error(f"Failed to save analytics: {e}")
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        return False
-
-def record_analytics_event(user_id: int, event_type: str, analysis_type: str = None, question: str = None):
-    """Regista evento de analytics"""
-    if not ENABLE_FOLLOWUP_ANALYTICS:
-        return
-    
-    try:
-        analytics = load_analytics()
-        
-        if event_type == 'followup_question' and question:
-            analytics.record_question(analysis_type, question)
-        
-        save_analytics(analytics)
-    except Exception as e:
-        logger.error(f"Failed to record analytics: {e}")
-
 # ==========================================
 # DATA EXTRACTION FUNCTIONS
 # ==========================================
 def extract_date(activity: Dict) -> Optional[str]:
-    """Extrai data de uma atividade (múltiplos formatos suportados)"""
+    """Extrai data de uma atividade"""
     if 'date' in activity and activity['date']:
         return activity['date']
     
@@ -721,7 +812,7 @@ def extract_date(activity: Dict) -> Optional[str]:
     return None
 
 def extract_sport(activity: Dict) -> str:
-    """Extrai tipo de esporte de uma atividade"""
+    """Extrai tipo de esporte"""
     if 'sport' in activity and activity['sport']:
         sport = activity['sport']
     elif 'activityName' in activity and activity['activityName']:
@@ -747,7 +838,7 @@ def extract_sport(activity: Dict) -> str:
     return sport
 
 def extract_duration(activity: Dict) -> float:
-    """Extrai duração em minutos de uma atividade"""
+    """Extrai duração em minutos"""
     if 'duration' not in activity:
         return 0.0
     
@@ -761,7 +852,7 @@ def extract_duration(activity: Dict) -> float:
         return float(duration_val) / 60
 
 def extract_distance(activity: Dict) -> Optional[float]:
-    """Extrai distância em km de uma atividade"""
+    """Extrai distância em km"""
     if 'distance' not in activity:
         return None
     
@@ -775,7 +866,7 @@ def extract_distance(activity: Dict) -> Optional[float]:
         return round(float(distance_val) / 1000, 2)
 
 def extract_heart_rate(activity: Dict) -> Optional[int]:
-    """Extrai frequência cardíaca média de uma atividade"""
+    """Extrai FC média"""
     for field in ['avg_hr', 'averageHR', 'avgHr', 'averageHeartRate']:
         if field in activity:
             hr = activity[field]
@@ -787,7 +878,7 @@ def extract_heart_rate(activity: Dict) -> Optional[int]:
     return None
 
 def extract_calories(activity: Dict) -> Optional[int]:
-    """Extrai calorias de uma atividade"""
+    """Extrai calorias"""
     for field in ['calories', 'kilocalories']:
         if field in activity:
             cal = activity[field]
@@ -799,7 +890,7 @@ def extract_calories(activity: Dict) -> Optional[int]:
     return None
 
 def infer_missing_sport(formatted: FormattedActivity) -> str:
-    """Infere tipo de esporte baseado em outras métricas"""
+    """Infere tipo de esporte"""
     if formatted.sport != 'Desconhecido':
         return formatted.sport
     
@@ -811,11 +902,7 @@ def infer_missing_sport(formatted: FormattedActivity) -> str:
     return 'Desconhecido'
 
 def format_activity(activity: Dict) -> Optional[FormattedActivity]:
-    """
-    Formata uma atividade para exibição unificada.
-    Suporta múltiplos formatos e faz merge de dados.
-    Retorna None se a atividade não tem data válida.
-    """
+    """Formata atividade para display"""
     date = extract_date(activity)
     
     if not date:
@@ -839,7 +926,7 @@ def format_activity(activity: Dict) -> Optional[FormattedActivity]:
     return formatted
 
 def extract_hrv(data: Dict) -> Optional[float]:
-    """Extrai HRV com validação robusta"""
+    """Extrai HRV"""
     try:
         if 'hrv' not in data or not isinstance(data['hrv'], dict):
             return None
@@ -852,11 +939,11 @@ def extract_hrv(data: Dict) -> Optional[float]:
         return float(hrv) if hrv is not None else None
         
     except (TypeError, ValueError, AttributeError) as e:
-        logger.warning(f"HRV extraction failed for date {data.get('date')}: {e}")
+        logger.warning(f"HRV extraction failed: {e}")
         return None
 
 def extract_rhr(data: Dict) -> Optional[float]:
-    """Extrai RHR (Resting Heart Rate) com validação robusta"""
+    """Extrai RHR"""
     try:
         if 'stats' not in data or not isinstance(data['stats'], dict):
             return None
@@ -865,11 +952,11 @@ def extract_rhr(data: Dict) -> Optional[float]:
         return float(rhr) if rhr is not None else None
         
     except (TypeError, ValueError, AttributeError) as e:
-        logger.warning(f"RHR extraction failed for date {data.get('date')}: {e}")
+        logger.warning(f"RHR extraction failed: {e}")
         return None
 
 def extract_sleep_score(data: Dict) -> Optional[int]:
-    """Extrai Sleep Score com validação robusta"""
+    """Extrai Sleep Score"""
     try:
         if 'sleep' not in data or not isinstance(data['sleep'], dict):
             return None
@@ -891,11 +978,11 @@ def extract_sleep_score(data: Dict) -> Optional[int]:
         return None
         
     except (TypeError, ValueError, AttributeError) as e:
-        logger.warning(f"Sleep score extraction failed for date {data.get('date')}: {e}")
+        logger.warning(f"Sleep score extraction failed: {e}")
         return None
 
 def extract_training_load(data: Dict) -> Optional[float]:
-    """Extrai Training Load com validação robusta"""
+    """Extrai Training Load"""
     try:
         if 'stats' not in data or not isinstance(data['stats'], dict):
             return None
@@ -904,14 +991,11 @@ def extract_training_load(data: Dict) -> Optional[float]:
         return float(load) if load is not None else None
         
     except (TypeError, ValueError, AttributeError) as e:
-        logger.warning(f"Training load extraction failed for date {data.get('date')}: {e}")
+        logger.warning(f"Training load extraction failed: {e}")
         return None
 
 def parse_garmin_history(raw_data: List[Dict]) -> List[BiometricDay]:
-    """
-    Converte dados brutos do Garmin para lista de BiometricDay.
-    Validação robusta com logging específico de falhas.
-    """
+    """Converte dados Garmin para BiometricDay"""
     if not raw_data:
         return []
     
@@ -934,13 +1018,10 @@ def parse_garmin_history(raw_data: List[Dict]) -> List[BiometricDay]:
     return history
 
 # ==========================================
-# FILE OPERATIONS (with safety)
+# FILE OPERATIONS
 # ==========================================
 def atomic_write_json(path: str, data: Any) -> None:
-    """
-    Escreve JSON de forma atômica para evitar corrupção.
-    Usa write-to-temp + rename pattern.
-    """
+    """Atomic write com temp file"""
     temp_path = path + '.tmp'
     try:
         with open(temp_path, 'w') as f:
@@ -952,10 +1033,7 @@ def atomic_write_json(path: str, data: Any) -> None:
         raise FileOperationError(f"Failed to write {path}: {e}")
 
 def load_json_safe(path: str, default: Any = None) -> Any:
-    """
-    Carrega JSON com validação e fallback.
-    Retorna default se arquivo não existe ou está corrompido.
-    """
+    """Load JSON com fallback"""
     if not os.path.exists(path):
         return default
     
@@ -977,36 +1055,34 @@ def load_json_safe(path: str, default: Any = None) -> Any:
         return default
 
 def load_garmin_data() -> Optional[List[Dict]]:
-    """Carrega dados consolidados do Garmin"""
+    """Carrega dados Garmin"""
     path = os.path.join(DATA_DIR, 'garmin_data_consolidated.json')
     data = load_json_safe(path, default=[])
     
     if not isinstance(data, list):
-        logger.error(f"garmin_data_consolidated.json is not a list: {type(data)}")
+        logger.error(f"garmin_data_consolidated.json is not a list")
         return None
     
     return data if data else None
 
 def load_activities() -> List[Dict]:
-    """Carrega histórico de atividades com validação"""
+    """Carrega atividades"""
     path = os.path.join(DATA_DIR, 'activities.json')
     data = load_json_safe(path, default=[])
     
     if not isinstance(data, list):
-        logger.error(f"activities.json is not a list: {type(data)}")
+        logger.error(f"activities.json is not a list")
         return []
     
     valid_activities = []
     for item in data:
         if isinstance(item, dict):
             valid_activities.append(item)
-        else:
-            logger.warning(f"Invalid activity item skipped: {item}")
     
     return valid_activities
 
 def save_activities(activities: List[Dict]) -> bool:
-    """Salva atividades com atomic write"""
+    """Salva atividades"""
     path = os.path.join(DATA_DIR, 'activities.json')
     try:
         atomic_write_json(path, activities)
@@ -1016,13 +1092,10 @@ def save_activities(activities: List[Dict]) -> bool:
         return False
 
 # ==========================================
-# ACTIVITY FILTERING AND VALIDATION
+# ACTIVITY MANAGEMENT
 # ==========================================
 def get_all_formatted_activities() -> List[FormattedActivity]:
-    """
-    Carrega e formata TODAS as atividades válidas.
-    Retorna lista ordenada por data (mais recente primeiro).
-    """
+    """Carrega todas as atividades"""
     activities = load_activities()
     
     formatted_activities = []
@@ -1032,14 +1105,10 @@ def get_all_formatted_activities() -> List[FormattedActivity]:
             formatted_activities.append(formatted)
     
     formatted_activities.sort(key=lambda x: x.date, reverse=True)
-    
     return formatted_activities
 
 def get_activities_by_date(target_date: str) -> List[FormattedActivity]:
-    """
-    Carrega e filtra atividades por data específica.
-    Mais eficiente que carregar todas e depois filtrar.
-    """
+    """Filtra atividades por data"""
     activities = load_activities()
     
     filtered_activities = []
@@ -1051,12 +1120,7 @@ def get_activities_by_date(target_date: str) -> List[FormattedActivity]:
     return filtered_activities
 
 def find_activities_for_analysis() -> Tuple[List[FormattedActivity], str, str]:
-    """
-    Encontra TODAS as atividades apropriadas para análise seguindo as regras:
-    1. Se existem atividades de hoje → usar todas de hoje
-    2. Se não existe hoje mas existe ontem → usar todas de ontem
-    3. Se não existe hoje nem ontem → retornar lista vazia com mensagem
-    """
+    """Encontra atividades para análise (hoje ou ontem)"""
     today_str = datetime.now().strftime('%Y-%m-%d')
     yesterday_str = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     
@@ -1066,7 +1130,7 @@ def find_activities_for_analysis() -> Tuple[List[FormattedActivity], str, str]:
         msg = format_found_activities_message(count, today_str, is_today=True)
         
         if count > MAX_ACTIVITIES_IN_ANALYSIS:
-            logger.warning(f"Limitando análise de {count} para {MAX_ACTIVITIES_IN_ANALYSIS} atividades")
+            logger.warning(f"Limitando análise a {MAX_ACTIVITIES_IN_ANALYSIS}")
             today_activities = today_activities[:MAX_ACTIVITIES_IN_ANALYSIS]
         
         return today_activities, today_str, msg
@@ -1077,7 +1141,6 @@ def find_activities_for_analysis() -> Tuple[List[FormattedActivity], str, str]:
         msg = format_found_activities_message(count, yesterday_str, is_today=False)
         
         if count > MAX_ACTIVITIES_IN_ANALYSIS:
-            logger.warning(f"Limitando análise de {count} para {MAX_ACTIVITIES_IN_ANALYSIS} atividades")
             yesterday_activities = yesterday_activities[:MAX_ACTIVITIES_IN_ANALYSIS]
         
         return yesterday_activities, yesterday_str, msg
@@ -1085,126 +1148,24 @@ def find_activities_for_analysis() -> Tuple[List[FormattedActivity], str, str]:
     all_activities = get_all_formatted_activities()
     
     if not all_activities:
-        return [], "", "❌ Não existem atividades registadas no sistema."
+        return [], "", "❌ Não existem atividades registadas."
     
     most_recent = all_activities[0]
     return [], "", (
         f"❌ Não existem atividades de hoje ({today_str}) nem ontem ({yesterday_str}).\n\n"
-        f"Última atividade registada: {most_recent.date} - {most_recent.sport}\n\n"
-        f"Para analisar aderência ao plano, preciso de atividades recentes (hoje ou ontem)."
+        f"Última atividade: {most_recent.date} - {most_recent.sport}"
     )
 
-# ==========================================
-# REQUEST MANAGEMENT
-# ==========================================
-def create_import_request(days: int = 7) -> bool:
-    """Cria flag file para importação histórica (atomic write)"""
-    try:
-        flag_path = os.path.join(DATA_DIR, 'import_request.json')
-        request = {
-            'days': days,
-            'requested_at': datetime.now().isoformat(),
-            'status': 'pending'
-        }
-        
-        atomic_write_json(flag_path, request)
-        logger.info(f"Import request created: {days} dias")
-        return True
-        
-    except FileOperationError as e:
-        logger.error(f"Failed to create import request: {e}")
-        return False
-
-def create_sync_request() -> bool:
-    """Cria flag file para sincronização (atomic write)"""
-    try:
-        flag_path = os.path.join(DATA_DIR, 'sync_request.json')
-        request = {
-            'requested_at': datetime.now().isoformat(),
-            'status': 'pending'
-        }
-        
-        atomic_write_json(flag_path, request)
-        logger.info("Sync request created")
-        return True
-        
-    except FileOperationError as e:
-        logger.error(f"Failed to create sync request: {e}")
-        return False
-
-def check_request_status(request_type: str = 'import') -> Optional[str]:
-    """
-    Verifica o status de um pedido (import ou sync).
-    Retorna: 'pending', 'completed', 'failed', ou None se não existe.
-    """
-    filename = f'{request_type}_request.json'
-    flag_path = os.path.join(DATA_DIR, filename)
-    
-    data = load_json_safe(flag_path)
-    if not data:
-        return None
-    
-    return data.get('status')
-
-def cleanup_old_flags() -> Tuple[int, List[str]]:
-    """
-    Limpa flags pending com mais de FLAG_TIMEOUT_SECONDS.
-    Retorna: (flags_limpos, mensagens)
-    """
-    cleaned = 0
-    messages = []
-    
-    for flag_name in ['import_request.json', 'sync_request.json']:
-        flag_path = os.path.join(DATA_DIR, flag_name)
-        
-        data = load_json_safe(flag_path)
-        if not data:
-            messages.append(f"ℹ️  {flag_name.replace('_request.json', '')}: não existe")
-            continue
-        
-        status = data.get('status')
-        
-        if status == 'pending':
-            try:
-                requested_at = datetime.fromisoformat(data['requested_at'])
-                age_seconds = (datetime.now() - requested_at).total_seconds()
-                
-                if age_seconds > FLAG_TIMEOUT_SECONDS:
-                    data['status'] = 'completed'
-                    data['processed_at'] = datetime.now().isoformat()
-                    data['cleaned_by'] = 'auto_cleanup'
-                    
-                    atomic_write_json(flag_path, data)
-                    
-                    cleaned += 1
-                    messages.append(f"✅ {flag_name.replace('_request.json', '')}: pending há {int(age_seconds)}s → completed")
-                else:
-                    messages.append(f"⏳ {flag_name.replace('_request.json', '')}: pending recente ({int(age_seconds)}s)")
-            except Exception as e:
-                messages.append(f"❌ Erro em {flag_name}: {e}")
-        elif status == 'completed':
-            messages.append(f"✅ {flag_name.replace('_request.json', '')}: já completed")
-        else:
-            messages.append(f"❓ {flag_name.replace('_request.json', '')}: status {status}")
-    
-    return cleaned, messages
-
-# ==========================================
-# ACTIVITY MANAGEMENT
-# ==========================================
 def reorganize_activities() -> Tuple[int, int, List[str]]:
-    """
-    Reorganiza activities.json: remove duplicados e ordena por data.
-    Retorna: (duplicados_removidos, total_final, mensagens)
-    """
+    """Reorganiza activities.json"""
     messages = []
     
     activities = load_activities()
     if not activities:
-        return 0, 0, ["ℹ️  activities.json não existe ou está vazio"]
+        return 0, 0, ["ℹ️ activities.json vazio"]
     
     original_count = len(activities)
-    messages.append(f"📊 Total original: {original_count} atividades")
+    messages.append(f"📊 Total original: {original_count}")
     
     seen_ids = set()
     unique_activities = []
@@ -1225,80 +1186,107 @@ def reorganize_activities() -> Tuple[int, int, List[str]]:
     duplicates_removed = original_count - len(unique_activities)
     
     if duplicates_removed > 0:
-        messages.append(f"🗑️  Removidos {duplicates_removed} duplicados")
+        messages.append(f"🗑️ Removidos {duplicates_removed} duplicados")
     
     unique_activities.sort(key=lambda x: extract_date(x) or '0000-00-00', reverse=True)
     
-    trimmed = 0
     if len(unique_activities) > MAX_ACTIVITIES_STORED:
         trimmed = len(unique_activities) - MAX_ACTIVITIES_STORED
         unique_activities = unique_activities[:MAX_ACTIVITIES_STORED]
-        messages.append(f"✂️  Limitadas a {MAX_ACTIVITIES_STORED} (removidas {trimmed} mais antigas)")
+        messages.append(f"✂️ Limitadas a {MAX_ACTIVITIES_STORED}")
     
     if save_activities(unique_activities):
-        messages.append(f"✅ Activities.json reorganizado: {len(unique_activities)} atividades")
+        messages.append(f"✅ Reorganizado: {len(unique_activities)} atividades")
     else:
-        messages.append("❌ Falha ao salvar activities.json")
-        return duplicates_removed, len(unique_activities), messages
-    
-    if len(unique_activities) >= 3:
-        messages.append("\n📋 Últimas 3:")
-        for i in range(min(3, len(unique_activities))):
-            formatted = format_activity(unique_activities[i])
-            if formatted:
-                messages.append(f"  {i+1}. {formatted.date} - {formatted.sport} ({formatted.duration_min}min)")
+        messages.append("❌ Falha ao salvar")
     
     return duplicates_removed, len(unique_activities), messages
 
 # ==========================================
-# HEALTH CHECKS
+# REQUEST MANAGEMENT
 # ==========================================
-def check_garmin_fetcher_health() -> Tuple[bool, str]:
-    """
-    Verifica se o garmin-fetcher está funcional verificando:
-    1. Se o arquivo consolidado existe
-    2. Se foi atualizado recentemente (últimas 2 horas)
-    3. Se tem conteúdo válido
-    """
-    consolidated_path = os.path.join(DATA_DIR, 'garmin_data_consolidated.json')
-    
-    if not os.path.exists(consolidated_path):
-        return False, "Arquivo consolidado não existe"
-    
+def create_import_request(days: int = 7) -> bool:
+    """Cria pedido de importação"""
     try:
-        mod_time = os.path.getmtime(consolidated_path)
-        age_hours = (time.time() - mod_time) / 3600
+        flag_path = os.path.join(DATA_DIR, 'import_request.json')
+        request = {
+            'days': days,
+            'requested_at': datetime.now().isoformat(),
+            'status': 'pending'
+        }
         
-        if age_hours > 2:
-            return False, f"Dados desatualizados (última atualização há {age_hours:.1f}h)"
+        atomic_write_json(flag_path, request)
+        logger.info(f"Import request created: {days} dias")
+        return True
         
-        data = load_garmin_data()
-        if not data or len(data) == 0:
-            return False, "Arquivo consolidado vazio"
-        
-        return True, "OK"
-        
-    except Exception as e:
-        return False, f"Erro ao verificar: {e}"
+    except FileOperationError as e:
+        logger.error(f"Failed to create import request: {e}")
+        return False
 
-def list_data_files() -> List[str]:
-    """Lista arquivos de dados disponíveis"""
+def create_sync_request() -> bool:
+    """Cria pedido de sync"""
     try:
-        files = [f for f in os.listdir(DATA_DIR) 
-                if f.startswith('garmin_data_') and f.endswith('.json')]
-        return sorted(files)
-    except Exception as e:
-        logger.error(f"Failed to list data files: {e}")
-        return []
+        flag_path = os.path.join(DATA_DIR, 'sync_request.json')
+        request = {
+            'requested_at': datetime.now().isoformat(),
+            'status': 'pending'
+        }
+        
+        atomic_write_json(flag_path, request)
+        logger.info("Sync request created")
+        return True
+        
+    except FileOperationError as e:
+        logger.error(f"Failed to create sync request: {e}")
+        return False
+
+def check_request_status(request_type: str = 'import') -> Optional[str]:
+    """Verifica status de pedido"""
+    filename = f'{request_type}_request.json'
+    flag_path = os.path.join(DATA_DIR, filename)
+    
+    data = load_json_safe(flag_path)
+    if not data:
+        return None
+    
+    return data.get('status')
+
+def cleanup_old_flags() -> Tuple[int, List[str]]:
+    """Limpa flags antigos"""
+    cleaned = 0
+    messages = []
+    
+    for flag_name in ['import_request.json', 'sync_request.json']:
+        flag_path = os.path.join(DATA_DIR, flag_name)
+        
+        data = load_json_safe(flag_path)
+        if not data:
+            continue
+        
+        status = data.get('status')
+        
+        if status == 'pending':
+            try:
+                requested_at = datetime.fromisoformat(data['requested_at'])
+                age_seconds = (datetime.now() - requested_at).total_seconds()
+                
+                if age_seconds > FLAG_TIMEOUT_SECONDS:
+                    data['status'] = 'completed'
+                    data['processed_at'] = datetime.now().isoformat()
+                    
+                    atomic_write_json(flag_path, data)
+                    cleaned += 1
+                    messages.append(f"✅ {flag_name}: pending → completed")
+            except Exception as e:
+                messages.append(f"❌ Erro em {flag_name}: {e}")
+    
+    return cleaned, messages
 
 # ==========================================
-# SESSION STATE MANAGEMENT
+# SESSION STATE
 # ==========================================
 def get_session_state(context: ContextTypes.DEFAULT_TYPE) -> Optional[UserSessionState]:
-    """
-    Recupera e valida estado da sessão.
-    Retorna None se estado inválido.
-    """
+    """Recupera estado da sessão"""
     try:
         if not context.user_data:
             return None
@@ -1314,7 +1302,7 @@ def get_session_state(context: ContextTypes.DEFAULT_TYPE) -> Optional[UserSessio
         return None
 
 def save_session_state(context: ContextTypes.DEFAULT_TYPE, state: UserSessionState) -> None:
-    """Salva estado da sessão no context.user_data"""
+    """Salva estado da sessão"""
     context.user_data.update(state.to_dict())
 
 # ==========================================
@@ -1324,408 +1312,1025 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando inicial"""
     user_id = update.effective_user.id
     
-    # Tentar carregar contexto persistido
-    disk_data = load_context_from_disk(user_id)
-    if disk_data:
-        await update.message.reply_text("📂 Contexto anterior restaurado do disco.")
+    context_data = load_context_from_disk(user_id)
+    restore_msg = ""
+    if context_data:
+        restore_msg = "\n📂 Contexto anterior restaurado!"
     
     welcome_msg = (
-        f"🏋️ **FitnessJournal Bot v{BOT_VERSION}** - {BOT_VERSION_DESC}\n\n"
-        "Comandos disponíveis:\n"
-        "/start - Inicia o bot\n"
-        "/plan - Gera plano de treino diário\n"
-        "/check - Verifica dados Garmin\n"
-        "/import [dias] - Importa histórico (padrão: 7 dias)\n"
-        "/sync - Sincroniza dados Garmin\n"
-        "/status - Verifica status das flags\n"
-        "/cleanup - Limpa flags antigas\n"
-        "/reorganize - Reorganiza activities.json\n"
-        "/analyze - Analisa aderência ao plano\n"
-        "/activity - Analisa atividade individual\n"
-        "/history - Lista análises anteriores (v3.4)\n"
-        "/clear_context - Limpa contexto de follow-up (v3.4)\n"
-        "/stats - Estatísticas de perguntas (admin, v3.4)\n"
-        "/version - Mostra versão do bot\n\n"
-        "💬 **Novo em v3.4:** Contexto persiste entre restarts!"
+        f"🏋️ FitnessJournal Bot v{BOT_VERSION}\n"
+        f"{BOT_VERSION_DESC}{restore_msg}\n\n"
+        "Comandos:\n"
+        "/status - Ver readiness\n"
+        "/activities - Ver atividades\n"
+        "/analyze - Analisar aderência\n"
+        "/analyze_activity - Análise individual\n"
+        "/import - Importar dados\n"
+        "/sync - Sincronizar\n"
+        "/cleanup - Limpar flags\n"
+        "/history - Ver análises anteriores\n"
+        "/clear_context - Limpar contexto\n"
+        "/stats - Ver estatísticas\n"
+        "/debug - Info debug\n"
+        "/help - Ajuda"
     )
     
-    await update.message.reply_text(welcome_msg, parse_mode='Markdown')
+    await send_safe_message(update, welcome_msg)
 
-async def version(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mostra versão do bot"""
-    await update.message.reply_text(
-        f"🤖 **FitnessJournal Bot**\n"
-        f"Versão: {BOT_VERSION}\n"
-        f"Descrição: {BOT_VERSION_DESC}\n\n"
-        f"Features:\n"
-        f"✅ Follow-up Questions: {'Ativado' if ENABLE_FOLLOWUP_QUESTIONS else 'Desativado'}\n"
-        f"✅ Context Persistence: Ativado (v3.4)\n"
-        f"✅ Analytics: {'Ativado' if ENABLE_FOLLOWUP_ANALYTICS else 'Desativado'}\n"
-        f"✅ Cycling Types: Ativado (v3.4)",
-        parse_mode='Markdown'
-    )
-
-async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    v3.4: Lista histórico de análises anteriores.
-    """
-    analysis_history = context.user_data.get('analysis_history', [])
-    
-    if not analysis_history:
-        await update.message.reply_text(
-            "📭 Não há histórico de análises.\n\n"
-            "O histórico é criado quando fazes:\n"
-            "• /analyze - Aderência ao plano\n"
-            "• /activity - Análise individual"
-        )
-        return
-    
-    msg_parts = [f"📚 **Histórico de Análises** ({len(analysis_history)}):\n"]
-    
-    for i, ctx_dict in enumerate(reversed(analysis_history), 1):
-        try:
-            ctx = AnalysisContext.from_dict(ctx_dict)
-            
-            type_label = "Aderência" if ctx.analysis_type == 'adherence' else "Individual"
-            timestamp = ctx.timestamp.strftime("%d/%m %H:%M")
-            expired = " ❌ EXPIRADO" if ctx.is_expired() else ""
-            
-            activity_info = f" - {ctx.activity_date}" if ctx.activity_date else ""
-            
-            msg_parts.append(
-                f"{i}. {type_label}{activity_info}\n"
-                f"   {timestamp}{expired}"
-            )
-            
-        except Exception as e:
-            logger.error(f"Failed to parse history item {i}: {e}")
-            msg_parts.append(f"{i}. [Erro ao carregar]")
-    
-    msg_parts.append(
-        f"\n💡 Podes fazer perguntas sobre a última análise "
-        f"(válida por {ANALYSIS_CONTEXT_TIMEOUT}min)."
-    )
-    
-    await update.message.reply_text("\n".join(msg_parts), parse_mode='Markdown')
-
-async def clear_context_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    v3.4: Limpa contexto de follow-up (memória + disco).
-    """
-    user_id = update.effective_user.id
-    
-    # Limpar memória
-    context.user_data.pop('last_analysis_context', None)
-    context.user_data.pop('analysis_history', None)
-    
-    # Limpar disco
-    disk_cleared = clear_context_disk(user_id)
-    
-    msg = "🗑️ Contexto de follow-up limpo:\n"
-    msg += "✅ Memória limpa\n"
-    msg += f"{'✅' if disk_cleared else '⚠️'} Disco {'limpo' if disk_cleared else 'não tinha dados'}"
-    
-    await update.message.reply_text(msg)
-    logger.info(f"Context cleared for user {user_id}")
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    v3.4: Mostra estatísticas de follow-up questions (admin only).
-    """
-    if not ENABLE_FOLLOWUP_ANALYTICS:
-        await update.message.reply_text("⚠️ Analytics não estão ativadas.")
-        return
-    
-    analytics = load_analytics()
-    
-    if analytics.total_questions == 0:
-        await update.message.reply_text("📊 Ainda não há dados de analytics.")
-        return
-    
-    msg_parts = [
-        f"📊 **Analytics de Follow-Up Questions**\n",
-        f"Total de perguntas: {analytics.total_questions}\n",
-        f"\n**Por tipo:**"
-    ]
-    
-    for analysis_type, count in analytics.by_type.items():
-        percentage = (count / analytics.total_questions * 100) if analytics.total_questions > 0 else 0
-        msg_parts.append(f"  • {analysis_type}: {count} ({percentage:.1f}%)")
-    
-    if analytics.common_keywords:
-        top_keywords = sorted(
-            analytics.common_keywords.items(), 
-            key=lambda x: x[1], 
-            reverse=True
-        )[:10]
-        
-        msg_parts.append("\n**Top 10 palavras:**")
-        for word, count in top_keywords:
-            msg_parts.append(f"  • {word}: {count}x")
-    
-    if analytics.last_updated:
-        try:
-            last_update = datetime.fromisoformat(analytics.last_updated)
-            msg_parts.append(f"\n📅 Última atualização: {last_update.strftime('%d/%m/%Y %H:%M')}")
-        except:
-            pass
-    
-    await update.message.reply_text("\n".join(msg_parts), parse_mode='Markdown')
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    v3.3: Handler para mensagens de texto (follow-up questions).
-    v3.4: Agora com melhor error handling e analytics.
-    """
-    if not ENABLE_FOLLOWUP_QUESTIONS:
-        await update.message.reply_text(
-            "💬 Para interagir com o bot, usa os comandos disponíveis.\n"
-            "Envia /start para ver todos os comandos."
-        )
-        return
-    
-    user_id = update.effective_user.id
-    question = update.message.text.strip()
-    
-    if not question or len(question) < 3:
-        await update.message.reply_text("⚠️ Pergunta muito curta. Por favor, formula uma pergunta clara.")
-        return
-    
-    # Carregar contexto
-    try:
-        analysis_ctx = load_analysis_context(context)
-    except ContextExpiredError:
-        await update.message.reply_text(
-            "⏰ O contexto da análise anterior expirou.\n\n"
-            "Por favor, faz uma nova análise:\n"
-            "• /analyze - para aderência ao plano\n"
-            "• /activity - para atividade individual"
-        )
-        return
-    
-    if not analysis_ctx:
-        await update.message.reply_text(
-            "❓ Não há contexto de análise anterior.\n\n"
-            "Faz primeiro uma análise:\n"
-            "• /analyze - para aderência ao plano\n"
-            "• /activity - para atividade individual\n\n"
-            "Depois podes fazer perguntas sobre essa análise."
-        )
-        return
-    
-    # Verificar se está próximo de expirar
-    minutes_left = analysis_ctx.minutes_until_expiry()
-    if minutes_left < 2:
-        await update.message.reply_text(
-            f"⚠️ Atenção: O contexto expira em {minutes_left:.1f} minutos.\n"
-            "A tua pergunta será processada, mas considera fazer uma nova análise em breve."
-        )
-    
-    # Construir prompt
-    try:
-        prompt = build_followup_prompt(analysis_ctx, question)
-    except PromptTooLargeError as e:
-        await update.message.reply_text(
-            f"❌ Erro: {str(e)}\n\n"
-            "A análise anterior é muito longa. Faz uma nova análise mais específica."
-        )
-        return
-    
-    # Enviar ao Gemini
-    await update.message.reply_text("🤔 A processar a tua pergunta...")
-    
-    try:
-        response = model.generate_content(prompt)
-        answer = response.text
-        
-        # Analytics
-        if ENABLE_FOLLOWUP_ANALYTICS:
-            record_analytics_event(user_id, 'followup_question', analysis_ctx.analysis_type, question)
-        
-        # Enviar resposta
-        if len(answer) > TELEGRAM_SAFE_MESSAGE_LENGTH:
-            parts = split_long_message(answer)
-            for part in parts:
-                await update.message.reply_text(part)
-        else:
-            await update.message.reply_text(answer)
-        
-        logger.info(f"Follow-up question answered for user {user_id}")
-        
-    except Exception as e:
-        logger.error(f"Gemini API error: {e}")
-        await update.message.reply_text(
-            "❌ Erro ao processar a pergunta. Por favor, tenta novamente ou faz uma nova análise."
-        )
-
-async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Verifica dados disponíveis do Garmin"""
-    await update.message.reply_text("🔍 A verificar dados do Garmin...")
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Status"""
+    await update.message.reply_text("⏳ A extrair biometria...")
     
     data = load_garmin_data()
     
     if not data:
         await update.message.reply_text(
-            "❌ Nenhum dado Garmin encontrado.\n\n"
-            "Usa /import para carregar dados históricos ou /sync para sincronizar."
+            "❌ Nenhum dado disponível.\n\n"
+            "Usa /import para importar dados."
         )
         return
     
     history = parse_garmin_history(data)
     
-    if not history:
-        await update.message.reply_text("❌ Dados Garmin inválidos ou incompletos.")
+    if history and history[0].is_empty():
+        keyboard = [[InlineKeyboardButton("✅ Sincronizado", callback_data='sync_confirmed')]]
+        await update.message.reply_text(
+            f"⚠️ Dados de hoje vazios.\n\n"
+            f"Sincroniza o Garmin e carrega no botão.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        context.user_data['awaiting_sync'] = True
         return
     
-    valid_days = [d for d in history if d.is_valid()]
+    valid = [h for h in history if h.is_valid()]
     
-    msg = f"✅ Dados Garmin disponíveis:\n"
-    msg += f"Total de dias: {len(history)}\n"
-    msg += f"Dias com dados válidos: {len(valid_days)}\n\n"
+    if not valid:
+        await update.message.reply_text("⚠️ Dados insuficientes. Usa /import.")
+        return
     
-    if valid_days:
-        latest = valid_days[0]
-        msg += f"📅 Último dia com dados:\n"
-        msg += f"  Data: {latest.date}\n"
-        
-        if latest.hrv:
-            msg += f"  HRV: {latest.hrv}\n"
-        if latest.rhr:
-            msg += f"  RHR: {latest.rhr}\n"
-        if latest.sleep:
-            msg += f"  Sono: {latest.sleep}\n"
-        if latest.training_load:
-            msg += f"  Load: {latest.training_load}\n"
+    today = valid[0]
+    m_hrv = mean([h.hrv for h in valid[:7]])
+    m_rhr = mean([h.rhr for h in valid[:7]])
     
-    activities = load_activities()
-    msg += f"\n📊 Atividades registadas: {len(activities)}"
+    d_hrv = ((today.hrv - m_hrv) / m_hrv) * 100
+    d_rhr = ((today.rhr - m_rhr) / m_rhr) * 100
     
-    is_healthy, health_msg = check_garmin_fetcher_health()
-    msg += f"\n\n🏥 Garmin Fetcher: {health_msg}"
+    readiness = "MÉDIA"
+    if d_hrv > 2 and d_rhr < -2:
+        readiness = "ALTA"
+    elif d_hrv < -5 or d_rhr > 2:
+        readiness = "BAIXA"
+    
+    all_formatted = get_all_formatted_activities()
+    recent_formatted = all_formatted[:3]
+    recent_raw = [f.raw for f in recent_formatted]
+    recent_load = sum([h.training_load or 0 for h in valid[:3]])
+
+    msg = (
+        f"📊 HOJE ({today.date}):\n"
+        f"💓 RHR: {today.rhr}bpm ({d_rhr:+.1f}%)\n"
+        f"📈 HRV: {today.hrv}ms ({d_hrv:+.1f}%)\n"
+        f"😴 Sono: {today.sleep or 'N/A'}/100\n\n"
+        f"📅 MÉDIAS 7 DIAS:\n"
+        f"RHR: {m_rhr:.0f}bpm | HRV: {m_hrv:.0f}ms\n"
+        f"Carga 3 dias: {recent_load:.0f}\n\n"
+        f"🎯 READINESS: {readiness}"
+    )
+    
+    if recent_formatted:
+        msg += "\n\n🏃 ÚLTIMAS:"
+        for f in recent_formatted:
+            msg += f"\n• {f.to_brief_summary()}"
+
+    state = UserSessionState(
+        today=today,
+        d_hrv=d_hrv,
+        d_rhr=d_rhr,
+        m_hrv=m_hrv,
+        m_rhr=m_rhr,
+        history=valid[:5],
+        readiness=readiness,
+        recent_activities=recent_raw,
+        recent_load=recent_load
+    )
+    save_session_state(context, state)
+    
+    kb = [[
+        InlineKeyboardButton("✅ SIM - 20km+", callback_data='bike_yes'),
+        InlineKeyboardButton("❌ NÃO", callback_data='bike_no')
+    ]]
     
     await update.message.reply_text(msg)
+    await update.message.reply_text("🚴 Vais pedalar hoje?", reply_markup=InlineKeyboardMarkup(kb))
 
-async def import_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Importa dados históricos do Garmin"""
-    days = 7
+async def sync_confirmed_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback sync confirmado"""
+    query = update.callback_query
+    await query.answer()
     
-    if context.args:
-        try:
-            days = int(context.args[0])
-            days = max(1, min(days, 90))
-        except ValueError:
-            await update.message.reply_text("⚠️ Número de dias inválido. Usando padrão (7 dias).")
+    await query.edit_message_text("🔄 A criar pedido de sincronização...")
     
-    if create_import_request(days):
-        await update.message.reply_text(
-            f"✅ Pedido de importação criado: {days} dias.\n\n"
-            "O garmin-fetcher vai processar este pedido em breve.\n"
-            "Usa /status para verificar o progresso."
-        )
-    else:
-        await update.message.reply_text("❌ Erro ao criar pedido de importação.")
-
-async def sync_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sincroniza dados do Garmin"""
     if create_sync_request():
+        await query.message.reply_text("✅ Pedido criado. Usa /status em 1 min.")
+    else:
+        await query.message.reply_text("❌ Falha ao criar pedido.")
+    
+    context.user_data.clear()
+
+async def bike_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback decisão ciclismo"""
+    query = update.callback_query
+    await query.answer()
+    
+    state = get_session_state(context)
+    if not state:
+        await query.message.reply_text("❌ Sessão expirada. Usa /status novamente.")
+        return
+    
+    state.bike = (query.data == 'bike_yes')
+    save_session_state(context, state)
+    
+    await query.edit_message_text(f"🚴 Ciclismo: {'SIM' if state.bike else 'NÃO'}")
+    await query.message.reply_text("💭 Como te sentes hoje?")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    DISPATCHER INTELIGENTE
+    Se contexto recente → follow-up, senão → feeling
+    """
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    if not text or len(text) < 3:
+        await update.message.reply_text("⚠️ Mensagem muito curta.")
+        return
+    
+    # v3.6: Check rate limit
+    is_allowed, request_count = rate_limiter.check_rate_limit(user_id)
+    if not is_allowed:
         await update.message.reply_text(
-            "✅ Pedido de sincronização criado.\n\n"
-            "O garmin-fetcher vai sincronizar os dados em breve.\n"
-            "Usa /status para verificar o progresso."
+            f"⏱️ Limite de requisições atingido.\n"
+            f"Por favor, aguarda 1 minuto."
+        )
+        return
+    
+    # Record request
+    rate_limiter.record_request(user_id)
+    
+    context_data = load_context_from_disk(user_id)
+    
+    if context_data and 'current' in context_data:
+        await handle_followup_question(update, context, text, context_data)
+    else:
+        await handle_feeling(update, context)
+
+async def handle_followup_question(update: Update, context: ContextTypes.DEFAULT_TYPE, question: str, context_data: Dict):
+    """
+    v3.6: Processa follow-up com retry, circuit breaker e cache.
+    """
+    user_id = update.effective_user.id
+    
+    await update.message.reply_text("🤔 A processar a tua pergunta...")
+    
+    try:
+        current = context_data['current']
+        original_prompt = current.get('prompt', '')
+        original_response = current.get('response', '')
+        analysis_type = current.get('analysis_type', 'general')
+        
+        followup_prompt = f"""CONTEXTO ANTERIOR:
+Tu és um treinador de elite. Aqui está a análise que fizeste recentemente:
+
+TIPO: {analysis_type}
+
+PROMPT ORIGINAL:
+{original_prompt[:2000]}
+
+TUA RESPOSTA ANTERIOR:
+{original_response[:3000]}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+O atleta tem agora esta DÚVIDA sobre a tua análise:
+
+"{question}"
+
+TAREFA:
+Responde de forma clara e direta, mantendo contexto da análise anterior.
+Usa PORTUGUÊS EUROPEU sem LaTeX."""
+
+        # v3.6: Chamar com retry e circuit breaker
+        response = await call_gemini_with_retry(followup_prompt)
+        
+        # Validar resposta
+        is_valid, text_or_error = validate_gemini_response(response)
+        
+        if not is_valid:
+            logger.error(f"Invalid Gemini response: {text_or_error}")
+            await update.message.reply_text(
+                "❌ Resposta inválida do Gemini.\n"
+                "Por favor, tenta reformular a pergunta."
+            )
+            return
+        
+        answer = text_or_error
+        
+        # Salvar interação
+        save_context_to_disk(user_id, followup_prompt, answer, f'followup_{analysis_type}')
+        
+        # Enviar
+        if len(answer) > TELEGRAM_SAFE_MESSAGE_LENGTH:
+            parts = split_long_message(answer)
+            for part in parts:
+                await send_safe_message(update, part)
+        else:
+            await send_safe_message(update, answer)
+        
+        logger.info(f"Follow-up answered for user {user_id}")
+        
+    except CircuitBreakerOpen:
+        await update.message.reply_text(
+            "⚠️ Serviço temporariamente indisponível.\n"
+            "Por favor, tenta novamente em 1 minuto."
+        )
+        
+    except GeminiTimeoutError as e:
+        logger.error(f"Gemini timeout: {e}")
+        await update.message.reply_text(
+            "⏱️ O Gemini demorou muito a responder.\n"
+            "Por favor, tenta uma pergunta mais simples."
+        )
+        
+    except Exception as e:
+        logger.error(f"Follow-up error: {e}")
+        await update.message.reply_text(
+            "❌ Erro ao processar pergunta.\n"
+            "⚠️ Serviço temporariamente indisponível."
+        )
+
+async def handle_feeling(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    v3.6: Gera plano com retry, circuit breaker e cache.
+    """
+    user_id = update.effective_user.id
+    
+    state = get_session_state(context)
+    if not state:
+        await update.message.reply_text("❌ Usa /status primeiro.")
+        return
+    
+    is_valid, error_msg = state.validate()
+    if not is_valid:
+        await update.message.reply_text(f"❌ {error_msg}\nUsa /status.")
+        return
+    
+    feeling = update.message.text.strip()
+    
+    if len(feeling) > MAX_FEELING_LENGTH:
+        await update.message.reply_text(f"⚠️ Muito longo ({len(feeling)} chars).")
+        return
+    
+    feeling = feeling.replace('\x00', '')
+    
+    proc_msg = await update.message.reply_text("🤖 Coach Gemini a processar...")
+    
+    try:
+        h_str = "\n".join([
+            f"• {h.date}: HRV {h.hrv}ms, RHR {h.rhr}bpm"
+            for h in state.history if h.is_valid()
+        ])
+        
+        activities_str = ""
+        if state.recent_activities:
+            acts = []
+            for act in state.recent_activities[:3]:
+                try:
+                    formatted = format_activity(act)
+                    if formatted:
+                        acts.append(formatted.to_brief_summary())
+                except:
+                    pass
+            
+            if acts:
+                activities_str = "\nAtividades: " + ", ".join(acts)
+
+        prompt = f"""DADOS DO ATLETA:
+📈 HRV: {state.today.hrv}ms ({state.d_hrv:+.1f}%)
+💓 RHR: {state.today.rhr}bpm ({state.d_rhr:+.1f}%)
+😴 Sono: {state.today.sleep}/100
+🎯 Readiness: {state.readiness}
+🚴 Ciclismo: {'SIM - 20km+' if state.bike else 'NÃO'}
+
+Últimos 5 dias:
+{h_str}{activities_str}
+
+Equipamento: {', '.join(EQUIPAMENTOS_GIM)}
+
+💭 SENSAÇÃO: "{feeling}"
+
+TAREFA:
+Gera plano de treino em tabela markdown.
+Usa PORTUGUÊS EUROPEU sem LaTeX."""
+
+        if len(prompt) > GEMINI_MAX_PROMPT_LENGTH:
+            prompt = truncate_text_safe(prompt, GEMINI_MAX_PROMPT_LENGTH)
+        
+        # v3.6: Chamar com retry e circuit breaker
+        response = await call_gemini_with_retry(prompt)
+        
+        # Validar resposta
+        is_valid_response, text_or_error = validate_gemini_response(response)
+        
+        if not is_valid_response:
+            logger.error(f"Invalid plan response: {text_or_error}")
+            await proc_msg.edit_text(
+                "❌ Resposta inválida do Gemini.\n"
+                "Por favor, descreve o teu estado novamente."
+            )
+            return
+        
+        plan_text = text_or_error
+        
+        await proc_msg.delete()
+        
+        state.last_plan = plan_text
+        state.last_plan_date = state.today.date
+        save_session_state(context, state)
+        
+        save_context_to_disk(user_id, prompt, plan_text, 'plan')
+        
+        await send_safe_message(update, f"📋 PLANO:\n\n{plan_text}")
+        
+    except CircuitBreakerOpen:
+        try:
+            await proc_msg.edit_text(
+                "⚠️ Serviço temporariamente indisponível.\n"
+                "Por favor, tenta novamente em 1 minuto."
+            )
+        except:
+            await update.message.reply_text("⚠️ Serviço indisponível.")
+            
+    except GeminiTimeoutError as e:
+        logger.error(f"Plan timeout: {e}")
+        try:
+            await proc_msg.edit_text(
+                "⏱️ O Gemini demorou muito a responder.\n"
+                "Por favor, tenta descrever o teu estado de forma mais concisa."
+            )
+        except:
+            await update.message.reply_text("⏱️ Timeout ao gerar plano.")
+            
+    except Exception as e:
+        logger.error(f"handle_feeling error: {e}")
+        
+        try:
+            await proc_msg.edit_text(
+                "❌ Falha com Gemini.\n"
+                "⚠️ Serviço temporariamente indisponível."
+            )
+        except:
+            await update.message.reply_text("❌ Erro ao gerar plano.")
+
+async def activities_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mostra atividades"""
+    all_formatted = get_all_formatted_activities()
+    
+    if not all_formatted:
+        await update.message.reply_text("❌ Nenhuma atividade.")
+        return
+    
+    recent = all_formatted[:MAX_ACTIVITIES_DISPLAY]
+    
+    msg = f"🏃 ÚLTIMAS {len(recent)}:\n\n"
+    for f in recent:
+        msg += f.to_detailed_summary() + "\n\n"
+    
+    await send_safe_message(update, msg)
+
+async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Analisa aderência ao plano.
+    v3.6: Com retry, circuit breaker e cache.
+    """
+    user_id = update.effective_user.id
+    
+    # v3.6: Check rate limit
+    is_allowed, request_count = rate_limiter.check_rate_limit(user_id)
+    if not is_allowed:
+        await update.message.reply_text(
+            f"⏱️ Limite de requisições atingido.\n"
+            f"Por favor, aguarda 1 minuto."
+        )
+        return
+    
+    rate_limiter.record_request(user_id)
+    
+    await update.message.reply_text("🔍 A procurar atividades...")
+    
+    activities, date, msg = find_activities_for_analysis()
+    
+    if not activities:
+        await update.message.reply_text(msg)
+        return
+    
+    count = len(activities)
+    summary = f"{msg}\n\n📋 {count} atividade(s):\n\n"
+    
+    for i, act in enumerate(activities, 1):
+        if count > 1:
+            summary += f"**Atividade {i}:**\n"
+        summary += act.to_detailed_summary() + "\n\n"
+    
+    await send_safe_message(update, summary, parse_mode='Markdown')
+    
+    details = f"DATA: {date}\nTOTAL: {count}\n\n"
+    
+    for i, act in enumerate(activities, 1):
+        details += f"ATIVIDADE {i}:\n"
+        details += f"TIPO: {act.sport}\n"
+        details += f"DURAÇÃO: {act.duration_min}min\n"
+        
+        if act.distance_km:
+            details += f"DISTÂNCIA: {act.distance_km}km\n"
+        if act.avg_hr:
+            details += f"FC: {act.avg_hr}bpm\n"
+        if act.load:
+            details += f"LOAD: {act.load}\n"
+        details += "\n"
+    
+    state = get_session_state(context)
+    last_plan = state.last_plan if state and state.last_plan else 'Nenhum plano.'
+    
+    prompt = f"""ANÁLISE DE ADERÊNCIA
+
+PLANO:
+{last_plan}
+
+ATIVIDADES EXECUTADAS:
+{details}
+
+TAREFA:
+Analisa aderência completa.
+Usa PORTUGUÊS EUROPEU sem LaTeX."""
+
+    try:
+        if len(prompt) > GEMINI_MAX_PROMPT_LENGTH:
+            await update.message.reply_text("⚠️ Análise muito extensa.")
+            return
+        
+        proc_msg = await update.message.reply_text("🤖 A analisar...")
+        
+        # v3.6: Chamar com retry e circuit breaker
+        response = await call_gemini_with_retry(prompt)
+        
+        # Validar
+        is_valid_response, text_or_error = validate_gemini_response(response)
+        
+        if not is_valid_response:
+            await proc_msg.edit_text(f"❌ Resposta inválida: {text_or_error}")
+            return
+        
+        analysis = text_or_error
+        
+        await proc_msg.delete()
+        
+        save_context_to_disk(user_id, prompt, analysis, 'adherence')
+        
+        parts = split_long_message(analysis)
+        
+        for i, part in enumerate(parts, 1):
+            header = f"📊 ANÁLISE - Parte {i}/{len(parts)}:\n\n" if len(parts) > 1 and i == 1 else ""
+            await send_safe_message(update, f"{header}{part}")
+        
+    except CircuitBreakerOpen:
+        await update.message.reply_text(
+            "⚠️ Serviço temporariamente indisponível.\n"
+            "Por favor, tenta novamente em 1 minuto."
+        )
+        
+    except GeminiTimeoutError:
+        await update.message.reply_text("⏱️ Timeout ao analisar. Tenta limitar atividades.")
+        
+    except Exception as e:
+        logger.error(f"analyze error: {e}")
+        await update.message.reply_text("❌ Erro na análise.")
+
+async def analyze_activity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Lista atividades para análise individual.
+    NOVO na v3.6: Comando separado para listagem.
+    """
+    await update.message.reply_text("🔍 A procurar atividades...")
+    
+    all_activities = get_all_formatted_activities()
+    
+    if not all_activities:
+        await update.message.reply_text(
+            "❌ Não existem atividades registadas.\n\n"
+            "Usa /import ou /sync."
+        )
+        return
+    
+    # Salvar atividades no estado
+    state = get_session_state(context)
+    if state:
+        state.formatted_activities = all_activities[:MAX_ACTIVITIES_DISPLAY]
+        save_session_state(context, state)
+    else:
+        # Criar estado temporário apenas com atividades
+        context.user_data['formatted_activities'] = [asdict(a) for a in all_activities[:MAX_ACTIVITIES_DISPLAY]]
+    
+    # Criar botões
+    recent = all_activities[:MAX_ACTIVITIES_DISPLAY]
+    
+    buttons = []
+    for i, act in enumerate(recent):
+        btn_text = f"{act.date} - {act.sport} ({act.duration_min}min)"
+        buttons.append([InlineKeyboardButton(btn_text, callback_data=f"analyze_act_{i}")])
+    
+    await update.message.reply_text(
+        f"📋 Seleciona atividade para análise detalhada:\n\n"
+        f"Mostrando {len(recent)} atividades mais recentes.",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def analyze_activity_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Callback quando usuário seleciona atividade para análise.
+    NOVO na v3.6: Handler correto para callbacks.
+    """
+    query = update.callback_query
+    await query.answer()
+    
+    # Extrair índice do callback_data
+    try:
+        activity_index = int(query.data.split('_')[-1])
+    except (ValueError, IndexError):
+        await query.message.reply_text("❌ Erro ao processar seleção.")
+        return
+    
+    # Recuperar atividade
+    state = get_session_state(context)
+    if state and state.formatted_activities:
+        activities = state.formatted_activities
+    elif 'formatted_activities' in context.user_data:
+        activities = [FormattedActivity(**a) for a in context.user_data['formatted_activities']]
+    else:
+        await query.message.reply_text("❌ Sessão expirada. Usa /analyze_activity novamente.")
+        return
+    
+    if activity_index >= len(activities):
+        await query.message.reply_text("❌ Atividade não encontrada.")
+        return
+    
+    activity = activities[activity_index]
+    
+    # Guardar índice para próximos passos
+    if state:
+        state.selected_activity_index = activity_index
+        save_session_state(context, state)
+    else:
+        context.user_data['selected_activity_index'] = activity_index
+    
+    # Mostrar detalhes e perguntas
+    await query.edit_message_text(
+        f"✅ Selecionaste:\n\n{activity.to_detailed_summary()}"
+    )
+    
+    # Determinar perguntas baseado no tipo de atividade
+    sport_lower = activity.sport.lower()
+    
+    # Verificar se é ciclismo
+    is_cycling = any(bike_type in sport_lower for bike_type in ['cicl', 'bike', 'btt', 'mtb', 'spinning', 'estrada'])
+    
+    if is_cycling:
+        # Perguntar tipo de ciclismo
+        buttons = []
+        for cycle_type in CYCLING_TYPES:
+            buttons.append([InlineKeyboardButton(cycle_type, callback_data=f"cyctype_{cycle_type}_{activity_index}")])
+        
+        await query.message.reply_text(
+            "🚴 Que tipo de ciclismo?",
+            reply_markup=InlineKeyboardMarkup(buttons)
         )
     else:
-        await update.message.reply_text("❌ Erro ao criar pedido de sincronização.")
+        # Perguntar sobre carga
+        buttons = [
+            [InlineKeyboardButton("✅ SIM - Usei carga", callback_data=f"cargo_yes_{activity_index}")],
+            [InlineKeyboardButton("❌ NÃO - Peso corporal", callback_data=f"cargo_no_{activity_index}")]
+        ]
+        
+        await query.message.reply_text(
+            "💪 Usaste carga externa (halteres, barra, etc.)?",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
 
-async def status_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Verifica status dos pedidos"""
-    import_status = check_request_status('import')
-    sync_status = check_request_status('sync')
+async def cycling_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Callback para tipo de ciclismo.
+    NOVO na v3.6.
+    """
+    query = update.callback_query
+    await query.answer()
     
-    msg = "📊 **Status dos Pedidos:**\n\n"
+    # Parse: cyctype_<tipo>_<index>
+    parts = query.data.split('_')
+    if len(parts) < 3:
+        await query.message.reply_text("❌ Erro ao processar.")
+        return
     
-    msg += f"📥 Import: {import_status or 'Nenhum pedido'}\n"
-    msg += f"🔄 Sync: {sync_status or 'Nenhum pedido'}\n"
+    cycling_type = parts[1]
+    try:
+        activity_index = int(parts[2])
+    except ValueError:
+        await query.message.reply_text("❌ Erro ao processar índice.")
+        return
     
-    await update.message.reply_text(msg, parse_mode='Markdown')
+    await query.edit_message_text(f"🚴 Tipo: {cycling_type}")
+    
+    # Executar análise
+    await perform_activity_analysis(update, context, activity_index, cycling_type=cycling_type)
+
+async def cargo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Callback para pergunta sobre carga.
+    NOVO na v3.6.
+    """
+    query = update.callback_query
+    await query.answer()
+    
+    # Parse: cargo_<yes/no>_<index>
+    parts = query.data.split('_')
+    if len(parts) < 3:
+        await query.message.reply_text("❌ Erro ao processar.")
+        return
+    
+    used_weights = (parts[1] == 'yes')
+    try:
+        activity_index = int(parts[2])
+    except ValueError:
+        await query.message.reply_text("❌ Erro ao processar índice.")
+        return
+    
+    await query.edit_message_text(f"💪 Carga externa: {'SIM' if used_weights else 'NÃO'}")
+    
+    # Executar análise
+    await perform_activity_analysis(update, context, activity_index, used_weights=used_weights)
+
+async def perform_activity_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, activity_index: int, cycling_type: Optional[str] = None, used_weights: Optional[bool] = None):
+    """
+    Executa análise da atividade com Gemini.
+    NOVO na v3.6: Função separada com retry/circuit breaker/cache.
+    """
+    user_id = update.effective_user.id
+    
+    # v3.6: Check rate limit
+    is_allowed, request_count = rate_limiter.check_rate_limit(user_id)
+    if not is_allowed:
+        if update.callback_query:
+            await update.callback_query.message.reply_text(
+                f"⏱️ Limite de requisições atingido.\n"
+                f"Por favor, aguarda 1 minuto."
+            )
+        else:
+            await update.message.reply_text(
+                f"⏱️ Limite de requisições atingido.\n"
+                f"Por favor, aguarda 1 minuto."
+            )
+        return
+    
+    rate_limiter.record_request(user_id)
+    
+    # Recuperar atividade
+    state = get_session_state(context)
+    if state and state.formatted_activities:
+        activities = state.formatted_activities
+    elif 'formatted_activities' in context.user_data:
+        activities = [FormattedActivity(**a) for a in context.user_data['formatted_activities']]
+    else:
+        msg = "❌ Sessão expirada."
+        if update.callback_query:
+            await update.callback_query.message.reply_text(msg)
+        else:
+            await update.message.reply_text(msg)
+        return
+    
+    if activity_index >= len(activities):
+        msg = "❌ Atividade não encontrada."
+        if update.callback_query:
+            await update.callback_query.message.reply_text(msg)
+        else:
+            await update.message.reply_text(msg)
+        return
+    
+    activity = activities[activity_index]
+    
+    # Construir contexto adicional
+    extra_context = ""
+    if cycling_type:
+        extra_context = f"Tipo de ciclismo: {cycling_type}\n"
+    if used_weights is not None:
+        extra_context += f"Carga externa: {'Sim (halteres, barra, kettlebell)' if used_weights else 'Não (peso corporal apenas)'}\n"
+    
+    # Construir prompt
+    prompt = f"""ANÁLISE INDIVIDUAL DE ATIVIDADE
+
+DADOS DA ATIVIDADE:
+Data: {activity.date}
+Tipo: {activity.sport}
+Duração: {activity.duration_min} minutos"""
+
+    if activity.distance_km:
+        prompt += f"\nDistância: {activity.distance_km} km"
+    if activity.avg_hr:
+        prompt += f"\nFC média: {activity.avg_hr} bpm"
+    if activity.calories:
+        prompt += f"\nCalorias: {activity.calories}"
+    if activity.intensity:
+        prompt += f"\nZona: {activity.intensity}"
+    if activity.load:
+        prompt += f"\nLoad: {activity.load}"
+    
+    if extra_context:
+        prompt += f"\n\nCONTEXTO ADICIONAL:\n{extra_context}"
+    
+    prompt += f"""
+
+TAREFA:
+Analisa esta atividade de forma detalhada:
+- Qualidade da execução (baseado em FC, duração, distância)
+- Pontos fortes
+- Áreas de melhoria
+- Recomendações específicas para próxima sessão similar
+
+Usa PORTUGUÊS EUROPEU sem LaTeX."""
+
+    # Enviar mensagem de progresso
+    if update.callback_query:
+        proc_msg = await update.callback_query.message.reply_text("🤖 Coach Gemini a analisar...")
+    else:
+        proc_msg = await update.message.reply_text("🤖 Coach Gemini a analisar...")
+    
+    try:
+        # v3.6: Chamar com retry e circuit breaker
+        response = await call_gemini_with_retry(prompt)
+        
+        # Validar
+        is_valid, text_or_error = validate_gemini_response(response)
+        
+        if not is_valid:
+            await proc_msg.edit_text(f"❌ Resposta inválida: {text_or_error}")
+            return
+        
+        analysis = text_or_error
+        
+        await proc_msg.delete()
+        
+        # Salvar contexto
+        save_context_to_disk(user_id, prompt, analysis, 'activity_analysis')
+        
+        # Enviar análise
+        parts = split_long_message(analysis)
+        
+        for i, part in enumerate(parts, 1):
+            header = f"🔍 ANÁLISE INDIVIDUAL - Parte {i}/{len(parts)}:\n\n" if len(parts) > 1 and i == 1 else ""
+            
+            if update.callback_query:
+                await send_safe_message(
+                    Update(update.update_id, message=update.callback_query.message),
+                    f"{header}{part}"
+                )
+            else:
+                await send_safe_message(update, f"{header}{part}")
+        
+        logger.info(f"Activity analysis completed for user {user_id}")
+        
+    except CircuitBreakerOpen:
+        try:
+            await proc_msg.edit_text(
+                "⚠️ Serviço temporariamente indisponível.\n"
+                "Por favor, tenta novamente em 1 minuto."
+            )
+        except:
+            pass
+            
+    except GeminiTimeoutError:
+        try:
+            await proc_msg.edit_text("⏱️ Timeout ao analisar atividade.")
+        except:
+            pass
+            
+    except Exception as e:
+        logger.error(f"Activity analysis error: {e}")
+        try:
+            await proc_msg.edit_text("❌ Erro na análise da atividade.")
+        except:
+            pass
+
+async def import_historical(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Importa dados"""
+    await update.message.reply_text("📥 A criar pedido...")
+    
+    if create_import_request(7):
+        await update.message.reply_text("✅ Pedido criado. Aguarda 2-5min.")
+    else:
+        await update.message.reply_text("❌ Erro.")
+
+async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sync"""
+    await update.message.reply_text("🔄 A criar pedido...")
+    
+    if create_sync_request():
+        await update.message.reply_text("✅ Pedido criado. Aguarda 1min.")
+    else:
+        await update.message.reply_text("❌ Erro.")
 
 async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Limpa flags antigas"""
-    await update.message.reply_text("🧹 A limpar flags antigas...")
+    """Cleanup"""
+    await update.message.reply_text("🧹 A limpar...")
     
-    cleaned, messages = cleanup_old_flags()
+    try:
+        cleaned, messages = cleanup_old_flags()
+        duplicates, total, act_messages = reorganize_activities()
+        
+        msg = "🧹 LIMPEZA:\n\n"
+        msg += "FLAGS:\n" + "\n".join(messages[:5])
+        msg += f"\n\nATIVIDADES:\n" + "\n".join(act_messages[:5])
+        
+        await update.message.reply_text(msg)
+        
+    except Exception as e:
+        logger.error(f"cleanup error: {e}")
+        await update.message.reply_text("❌ Erro.")
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lista análises anteriores"""
+    user_id = update.effective_user.id
+    context_data = load_context_from_disk(user_id)
     
-    msg = f"✅ Limpeza concluída: {cleaned} flags atualizados\n\n"
-    msg += "\n".join(messages)
+    if not context_data or not context_data.get('history'):
+        await update.message.reply_text(
+            "📭 Sem histórico.\n\n"
+            "Cria análises com /analyze ou /analyze_activity."
+        )
+        return
+    
+    history = context_data['history']
+    
+    msg = f"📚 HISTÓRICO ({len(history)}):\n\n"
+    
+    for i, entry in enumerate(reversed(history), 1):
+        timestamp = entry.get('timestamp', 'N/A')
+        analysis_type = entry.get('analysis_type', 'unknown')
+        
+        try:
+            dt = datetime.fromisoformat(timestamp)
+            time_str = dt.strftime("%d/%m %H:%M")
+        except:
+            time_str = timestamp[:16]
+        
+        msg += f"{i}. {analysis_type} - {time_str}\n"
+    
+    msg += f"\n💡 Podes fazer perguntas (válido {CONTEXT_TIMEOUT_MINUTES}min)."
     
     await update.message.reply_text(msg)
 
-async def reorganize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reorganiza activities.json"""
-    await update.message.reply_text("🔧 A reorganizar activities.json...")
+async def clear_context_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Limpa contexto"""
+    user_id = update.effective_user.id
     
-    duplicates, total, messages = reorganize_activities()
+    if clear_context_disk(user_id):
+        await update.message.reply_text("🗑️ Contexto limpo.")
+    else:
+        await update.message.reply_text("ℹ️ Sem contexto.")
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Estatísticas"""
+    stats = get_context_stats()
     
-    msg = "✅ Reorganização concluída:\n\n"
-    msg += "\n".join(messages)
+    if 'error' in stats:
+        await update.message.reply_text(f"❌ Erro: {stats['error']}")
+        return
+    
+    msg = "📊 ESTATÍSTICAS:\n\n"
+    msg += f"👥 Users: {stats['total_users']}\n\n"
+    
+    if stats['by_type']:
+        msg += "Por tipo:\n"
+        for analysis_type, count in stats['by_type'].items():
+            msg += f"  • {analysis_type}: {count}\n"
+    
+    # v3.6: Adicionar stats de circuit breaker e cache
+    msg += f"\n🔌 Circuit Breaker:\n"
+    msg += f"  Estado: {circuit_breaker.state}\n"
+    msg += f"  Falhas: {circuit_breaker.failure_count}/{CIRCUIT_BREAKER_THRESHOLD}\n"
+    
+    msg += f"\n💾 Cache:\n"
+    msg += f"  Entradas: {len(response_cache.cache)}/{RESPONSE_CACHE_SIZE}\n"
     
     await update.message.reply_text(msg)
 
-async def analyze_adherence(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    v3.3: Analisa aderência ao plano com suporte para follow-up.
-    v3.4: Agora salva contexto em disco.
-    """
-    await update.message.reply_text("📊 A analisar aderência ao plano...")
+async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Debug"""
+    data = load_garmin_data()
+    all_activities = get_all_formatted_activities()
     
-    # [Resto do código de análise permanece igual...]
-    # No final, após gerar análise:
-    
-    # save_analysis_context(
-    #     context, 
-    #     'adherence', 
-    #     prompt_enviado_ao_gemini, 
-    #     resposta_do_gemini,
-    #     activity_date=date_analyzed
-    # )
+    msg = f"""🔧 DEBUG v{BOT_VERSION}:
 
-async def analyze_individual_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    v3.3: Analisa atividade individual com follow-up.
-    v3.4: Agora com cycling types e persistência.
-    """
-    # [Implementação completa omitida por brevidade]
-    # Inclui pergunta sobre tipo de ciclismo após "sem passageiro"
-    pass
+📊 Dados Garmin: {'Sim' if data else 'Não'}
+🏃 Atividades: {len(all_activities)}
+"""
+    
+    if data:
+        history = parse_garmin_history(data)
+        valid = [h for h in history if h.is_valid()]
+        msg += f"✅ Dias válidos: {len(valid)}"
+    
+    # v3.6: Info adicional
+    msg += f"\n\n🔌 Circuit Breaker: {circuit_breaker.state}"
+    msg += f"\n💾 Cache: {len(response_cache.cache)} entradas"
+    msg += f"\n⏱️ Rate limiter: {len(rate_limiter.requests)} users tracked"
+    
+    await update.message.reply_text(msg)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Help"""
+    await update.message.reply_text(
+        f"🏋️ FitnessJournal v{BOT_VERSION}\n\n"
+        "Comandos principais:\n"
+        "/status - Readiness\n"
+        "/analyze - Aderência ao plano\n"
+        "/analyze_activity - Análise individual\n"
+        "/history - Análises anteriores\n"
+        "/help - Ajuda\n\n"
+        "🆕 v3.6.0:\n"
+        "• Retry logic (3 tentativas)\n"
+        "• Circuit breaker\n"
+        "• Response caching\n"
+        "• Rate limiting por user"
+    )
 
 # ==========================================
 # MAIN
 # ==========================================
 def main():
     """Entry point"""
+    logger.info("=" * 50)
+    logger.info(f"FitnessJournal Bot v{BOT_VERSION}")
+    logger.info("=" * 50)
+    
     if not TELEGRAM_TOKEN:
         logger.error("TELEGRAM_TOKEN não configurado")
         return
     
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    if not os.environ.get("GEMINI_API_KEY"):
+        logger.error("GEMINI_API_KEY não configurado")
+        return
     
-    # Command handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("version", version))
-    application.add_handler(CommandHandler("check", check))
-    application.add_handler(CommandHandler("import", import_data))
-    application.add_handler(CommandHandler("sync", sync_data))
-    application.add_handler(CommandHandler("status", status_check))
-    application.add_handler(CommandHandler("cleanup", cleanup_command))
-    application.add_handler(CommandHandler("reorganize", reorganize_command))
-    application.add_handler(CommandHandler("history", history_command))
-    application.add_handler(CommandHandler("clear_context", clear_context_command))
-    application.add_handler(CommandHandler("stats", stats_command))
+    all_activities = get_all_formatted_activities()
+    logger.info(f"🏃 Atividades: {len(all_activities)}")
     
-    # Message handler (follow-up questions)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    logger.info("🧹 Auto-cleanup...")
+    cleaned, _ = cleanup_old_flags()
+    if cleaned > 0:
+        logger.info(f"✅ {cleaned} flags limpos")
     
-    logger.info(f"Bot v{BOT_VERSION} iniciado")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    # Command Handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("activities", activities_command))
+    app.add_handler(CommandHandler("analyze", analyze_command))
+    app.add_handler(CommandHandler("analyze_activity", analyze_activity_command))  # CORRIGIDO: agora aponta para função correta
+    app.add_handler(CommandHandler("import", import_historical))
+    app.add_handler(CommandHandler("sync", sync_command))
+    app.add_handler(CommandHandler("cleanup", cleanup_command))
+    app.add_handler(CommandHandler("history", history_command))
+    app.add_handler(CommandHandler("clear_context", clear_context_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("debug", debug_command))
+    app.add_handler(CommandHandler("help", help_command))
+    
+    # Callback Query Handlers - TODOS ATIVOS
+    app.add_handler(CallbackQueryHandler(sync_confirmed_callback, pattern=r'^sync_confirmed$'))
+    app.add_handler(CallbackQueryHandler(bike_callback, pattern=r'^bike_(yes|no)$'))
+    app.add_handler(CallbackQueryHandler(analyze_activity_callback, pattern=r'^analyze_act_\d+$'))  # ATIVADO
+    app.add_handler(CallbackQueryHandler(cargo_callback, pattern=r'^cargo_(yes|no)_\d+$'))  # ATIVADO
+    app.add_handler(CallbackQueryHandler(cycling_type_callback, pattern=r'^cyctype_\w+_\d+$'))  # ATIVADO
+    
+    # Message Handler (texto livre)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    logger.info("✅ Bot v3.6.0 iniciado com:")
+    logger.info(f"  - Retry logic: {MAX_RETRIES} tentativas")
+    logger.info(f"  - Circuit breaker: {CIRCUIT_BREAKER_THRESHOLD} falhas threshold")
+    logger.info(f"  - Cache: {RESPONSE_CACHE_SIZE} entradas, TTL {CACHE_TTL_SECONDS}s")
+    logger.info(f"  - Rate limit: {RATE_LIMIT_MAX_REQUESTS} req/{RATE_LIMIT_WINDOW}s por user")
+    
+    print(f"🤖 Bot v{BOT_VERSION} ativo")
+    
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()

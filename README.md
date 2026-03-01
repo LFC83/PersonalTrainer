@@ -125,7 +125,28 @@ EN: How do I clear pending requests?
 
 # Changelog
 
+## [3.6.0] - 2026-03-01
+
+### 🎯 Resumo da Versão
+Versão de estabilização crítica que resolve os problemas de inicialização da v3.5.1 e introduz camadas de resiliência "Enterprise-Grade" para a API Gemini e gestão de ficheiros.
+
+### 🚀 Added
+- **Análise Individual via Comando**: Novo comando `/analyze_activity` que permite selecionar uma atividade específica para análise profunda.
+- **Resiliência de API**: Implementação de *Exponential Backoff* (tentativas automáticas) para falhas temporárias do Gemini.
+- **Proteção Anti-Spam**: Rate limiting por utilizador para evitar sobrecarga da API e custos desnecessários.
+- **Validação de Integridade**: Verificação automática de JSONs corrompidos com sistema de auto-reparação.
+
+### 🐛 Fixed
+- **[CRITICAL]** Corrigido o erro de "Handler Mismatch" que impedia o bot de iniciar.
+- **Mapeamento de Botões**: Reativados e corrigidos os callbacks de Ciclismo (MTB/Estrada) e Carga/Passageiro.
+- **Memory Leaks**: Otimização do fecho de ficheiros e gestão de memória em processos longos.
+
+### 🔧 Changed
+- **Arquitetura de Handlers**: Separação clara entre comandos de texto e interações de botões (Inline Keyboards).
+- **Logging**: Implementação de logs estruturados para facilitar o diagnóstico de erros em produção.
+
 ### [3.5.1] - 2026-03-01 (Code Review Release)
+
 🐛 Critical Fixes
 
     Gemini Timeout: Adicionado timeout de 30s em todas as chamadas (GEMINI_TIMEOUT_SECONDS).
