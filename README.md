@@ -125,6 +125,159 @@ EN: How do I clear pending requests?
 
 # Changelog
 
+### [3.5.1] - 2026-03-01 (Code Review Release)
+🐛 Critical Fixes
+
+    Gemini Timeout: Adicionado timeout de 30s em todas as chamadas (GEMINI_TIMEOUT_SECONDS).
+
+    Response Validation: Criada função validate_gemini_response() para validar respostas vazias ou demasiado curtas.
+
+    Disk Space Check: Implementada a função has_disk_space() para verificar armazenamento antes de escrever contextos.
+
+    Race Condition: Melhorado o tratamento de erros em save_context_to_disk() com limpeza automática de ficheiros temporários.
+
+🔧 Novas Funções (Backend)
+
+    validate_gemini_response(response): Valida a integridade da resposta da IA.
+
+    call_gemini_with_timeout(prompt, timeout=30): Execução protegida contra bloqueios.
+
+    has_disk_space(path, min_mb=10): Prevenção de corrupção de ficheiros por falta de espaço.
+
+📝 Code Quality Improvements
+
+    Async Timeout: Implementação de asyncio.wait_for() e asyncio.to_thread() para chamadas não bloqueantes.
+
+    Validação Explícita: Respostas do Gemini validadas em 3 pontos críticos: handle_followup_question, handle_feeling e analyze_command.
+
+    Logging Detalhado: Distinção clara entre erros de timeout e erros de lógica da API.
+
+    Constantes: Definição de MIN_DISK_SPACE_MB e GEMINI_TIMEOUT_SECONDS no topo do ficheiro para fácil ajuste.
+
+🚫 Novas Excepções Personalizadas
+
+    GeminiTimeoutError: Tratamento específico para lentidão da API.
+
+    DiskSpaceError: Proteção contra falhas de escrita no servidor.
+
+🎯 User Experience
+
+    Mensagens Específicas: O bot informa agora: "⏱️ O Gemini demorou muito a responder" em vez de ficar mudo.
+
+    Feedback de Erro: Mensagem clara: "❌ Resposta inválida do Gemini" quando a IA falha na geração.
+
+    Fallback Gracioso: Garantia de que o bot nunca crasha, fornecendo sempre uma resposta ao utilizador.
+
+📊 Technical Debt Paid
+
+    ✅ Lógica de Validação Extraída: Aplicação do princípio DRY (Don't Repeat Yourself).
+
+    ✅ Separação de Responsabilidades: Timeout vs Validação vs Armazenamento.
+
+    ✅ Programação Defensiva: Validação antes da escrita e após a leitura.
+
+    ✅ Degradação Graciosa: Erros específicos convertidos em mensagens acionáveis.
+
+### [3.5.0] - 2026-03-01
+🎯 Objetivo
+
+Evolução da v2.2 (estável) para v3.5 com gestão de contexto persistente e perguntas de seguimento.
+✅ Implementado
+1. Dispatcher Inteligente (handle_message)
+
+    Lógica condicional: Se contexto existe (últimos 15min) → follow-up; caso contrário → feeling.
+
+    Routing transparente: O utilizador não precisa de mudar o comportamento habitual.
+
+    Validação de timeout: Os contextos expiram automaticamente após 15 minutos de inatividade.
+
+2. Persistência de Contexto
+
+    Ficheiros por utilizador: Armazenamento em user_context_{user_id}.json na pasta /data.
+
+    Histórico FIFO: Mantém as últimas 3 análises (MAX_CONTEXT_HISTORY).
+
+    Escrita Atómica: Garante a integridade dos dados mesmo em caso de crash durante a escrita.
+
+3. Tipos de Ciclismo Expandidos
+
+    Fluxo completo: Pergunta sobre passageiro → Se NÃO → Pergunta Tipo (Spinning/MTB/Commute/Estrada).
+
+    Novo callback: cycling_type_callback para processar a seleção do utilizador.
+
+    Contexto na análise: O tipo de ciclismo é incluído no prompt enviado ao Gemini.
+
+4. Markdown Resiliente
+
+    Função send_safe_message: Tenta enviar com Markdown; se ocorrer BadRequest, faz fallback automático para texto simples.
+
+    Estabilidade: O bot continua funcional mesmo que o Gemini gere caracteres de formatação inválidos.
+
+5. Novos Comandos
+
+    /history: Lista as últimas 3 análises com timestamps.
+
+    /clear_context: Remove o contexto atual e limpa o ficheiro em disco.
+
+    /stats: Analytics agregados (total de utilizadores e breakdown por tipo).
+
+🔧 Melhorias Técnicas
+
+    Tratamento de Erros:
+
+        Falhas na API Gemini: Retorna "Serviço temporariamente indisponível" de forma amigável.
+
+        Erros de I/O: Logging detalhado e salvaguarda de ficheiros.
+
+    Qualidade de Código:
+
+        Base sólida: Mantido 100% do código funcional da v2.2.
+
+        Incremental: Funcionalidades adicionadas sem necessidade de reescritas totais.
+
+    Performance:
+
+        Smart Context: Verifica primeiro a memória (RAM) antes de consultar o disco.
+
+        Truncagem Segura: Limita prompts e respostas a 5k/10k caracteres antes de guardar.
+
+        Polling: Uso de drop_pending_updates para evitar processar mensagens acumuladas após reinícios.
+
+📝 Matriz de Compatibilidade
+Funcionalidade	Estado	Descrição
+Readiness	✅	/status completo com métricas HRV/RHR
+Análise	✅	/analyze (aderência) e /analyze_activity (individual)
+Dados	✅	/import e /sync (sincronização Garmin)
+Manutenção	✅	/cleanup e /reorganize de ficheiros JSON
+Seguimento	🆕	handle_message com IA contextual
+Ciclismo	🆕	Seleção de sub-tipos (MTB, Estrada, etc.)
+Resiliência	🆕	send_safe_message com fallback de Markdown
+🐛 Correcções (Fixes)
+
+    Críticos:
+
+        Resolvida a f-string truncada da v3.4 ao restaurar a base da v2.2.
+
+        Mapeamento de todos os handlers e callbacks no main() para evitar funções órfãs.
+
+    Preventivos:
+
+        Limpeza automática de contextos expirados para evitar fugas de memória.
+
+        Limitação do histórico em disco para poupar espaço e processamento.
+
+📊 Verificação de Deployment
+
+    [x] Todos os comandos mapeados no main()
+
+    [x] Callbacks de botões registados corretamente
+
+    [x] Error handling em todas as funções async
+
+    [x] Escritas atómicas configuradas para persistência
+
+    [x] drop_pending_updates ativo no arranque
+
 ## [3.4.0] - 2026-02-28
 
 ### 🚀 Added
