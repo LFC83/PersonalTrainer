@@ -125,6 +125,60 @@ EN: How do I clear pending requests?
 
 # Changelog
 
+### CHANGELOG v3.8.0
+
+🎯 Objetivo da Versão
+Correção crítica de corrupção de dados + novas funcionalidades de telemetria e health check.
+
+🔴 CORREÇÕES CRÍTICAS (Prioridade Máxima)
+1. Blindagem do Sistema de Dados
+Problema: Bot crashava com AttributeError: 'list' object has no attribute 'items' quando activities.json estava corrompido como lista.
+Solução Implementada:
+
+✅ Resiliência de Leitura (load_activities_index):
+
+Detecta se activities.json é uma list
+Converte automaticamente para dict usando IDs das atividades
+Salva imediatamente no formato correto
+Log detalhado do processo de conversão
+
+
+✅ Consistência de Escrita (save_activities_index):
+
+Validação pré-escrita: Verifica que dados são dict antes de salvar
+Atomic Write: Escreve para .tmp primeiro, depois faz os.replace()
+Levanta FileOperationError se tentar salvar tipo inválido
+Cleanup automático de ficheiros temporários em caso de erro
+
+
+✅ Validação Extra (get_all_formatted_activities):
+
+Verifica tipo do activities_index após load
+Retorna lista vazia se tipo for inválido
+Log de erro detalhado
+
+### 🆕 NOVAS FUNCIONALIDADES v3.8.0
+
+3. Telemetria de Ciclismo
+Feature: Extração e display de cadência de ciclismo (rpm).
+Implementação:
+
+✅ Nova função: extract_bike_cadence_from_raw()
+
+Procura averageBikingCadenceInRevolutionsPerMinute
+Fallback para outros campos de cadência
+Só ativa para atividades de ciclismo
+
+
+✅ Campo bike_cadence adicionado a:
+
+FormattedActivity dataclass
+Parsing do Garmin (parse_activities_from_garmin)
+Enriquecimento automático (enrich_activity_from_garmin)
+
+
+✅ Display no resumo: "(120min, 45km, 150bpm, 85rpm)"
+
 ## [3.7.0] - 2026-03-01
 
 ## 🎯 Resumo da Versão

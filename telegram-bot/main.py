@@ -22,14 +22,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# CONFIGURATION & CONSTANTS
+# CONFIGURATION & CONSTANTS (v3.8.0)
 # ==========================================
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 logger.info("Gemini API configurada")
 
 # Bot Configuration
-BOT_VERSION = "3.7.0"
-BOT_VERSION_DESC = "Biometric Context + Altitude + Cadence + Intelligent Retry + System Prompt Update"
+BOT_VERSION = "3.8.0"
+BOT_VERSION_DESC = "Data Resilience + Health Check + Bike Cadence + Command Recovery"
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 DATA_DIR = '/data'
 
@@ -54,7 +54,7 @@ TELEGRAM_SAFE_MESSAGE_LENGTH = 4000
 
 # Gemini API Limits
 GEMINI_MAX_PROMPT_LENGTH = 30000
-GEMINI_TIMEOUT_SECONDS = 45  # v3.7.0: Aumentado de 30 para 45 segundos
+GEMINI_TIMEOUT_SECONDS = 60  # v3.8.0: Aumentado de 45 para 60 segundos
 
 # Context Management
 CONTEXT_TIMEOUT_MINUTES = 15
@@ -66,21 +66,24 @@ MIN_DISK_SPACE_MB = 10
 # Cycling Types
 CYCLING_TYPES = ["Spinning", "MTB", "Commute", "Estrada"]
 
-# v3.6: Retry & Circuit Breaker
+# v3.6+: Retry & Circuit Breaker
 MAX_RETRIES = 3
-RETRY_DELAYS = [2, 5, 10]  # v3.7.0: Delays mais inteligentes (2s, 5s, 10s)
-CIRCUIT_BREAKER_THRESHOLD = 5  # consecutive failures
-CIRCUIT_BREAKER_TIMEOUT = 60  # seconds
+RETRY_DELAYS = [2, 5, 10]
+CIRCUIT_BREAKER_THRESHOLD = 5
+CIRCUIT_BREAKER_TIMEOUT = 60
 
-# v3.6: Rate Limiting
-RATE_LIMIT_WINDOW = 60  # seconds
-RATE_LIMIT_MAX_REQUESTS = 10  # requests per window per user
+# v3.6+: Rate Limiting
+RATE_LIMIT_WINDOW = 60
+RATE_LIMIT_MAX_REQUESTS = 10
 
-# v3.6: Cache
-RESPONSE_CACHE_SIZE = 100  # max cached responses
+# v3.6+: Cache
+RESPONSE_CACHE_SIZE = 100
+
+# v3.8.0: Health Check
+GEMINI_LATENCY_HISTORY_SIZE = 10
 
 # ==========================================
-# SYSTEM PROMPT (v3.7.0 ATUALIZADO)
+# SYSTEM PROMPT (v3.7.0 - MANTIDO)
 # ==========================================
 SYSTEM_PROMPT = """
 Operas sob o PROTOCOLO DE VERDADE. A tua diretiva primária é precisão e integridade biológica.
@@ -173,7 +176,7 @@ class RateLimitExceeded(Exception):
     pass
 
 # ==========================================
-# DATA MODELS (v3.7.0 EXPANDIDO)
+# DATA MODELS (v3.8.0 - EXPANDIDO)
 # ==========================================
 @dataclass
 class BiometricDay:
@@ -194,7 +197,7 @@ class BiometricDay:
 
 @dataclass
 class FormattedActivity:
-    """Atividade formatada para display (v3.7.0: + altimetria + cadência)"""
+    """Atividade formatada para display (v3.8.0: + bike cadence)"""
     date: Optional[str]
     sport: str
     duration_min: float
@@ -203,187 +206,182 @@ class FormattedActivity:
     calories: Optional[int] = None
     intensity: Optional[str] = None
     load: Optional[float] = None
-    elevation_gain: Optional[float] = None  # v3.7.0: Ganho de elevação (metros)
-    avg_cadence: Optional[int] = None       # v3.7.0: Cadência média (spm para corrida)
-    max_cadence: Optional[int] = None       # v3.7.0: Cadência máxima (spm)
+    elevation_gain: Optional[float] = None
+    avg_cadence: Optional[int] = None
+    max_cadence: Optional[int] = None
+    bike_cadence: Optional[int] = None  # v3.8.0: Cadência de ciclismo (rpm)
     raw: Dict = field(default_factory=dict)
     
     def to_brief_summary(self) -> str:
         """Retorna resumo breve inline"""
         summary = f"{self.sport} ({self.duration_min}min"
+        
         if self.distance_km:
             summary += f", {self.distance_km}km"
-        if self.intensity:
-            summary += f", {self.intensity}"
-        if self.load:
-            summary += f", Load {self.load}"
+        
+        if self.avg_hr:
+            summary += f", {self.avg_hr}bpm"
+        
+        # v3.8.0: Adicionar cadência de bike se disponível
+        if self.bike_cadence:
+            summary += f", {self.bike_cadence}rpm"
+        
+        # v3.7.0: Adicionar cadência de corrida se disponível
+        if self.avg_cadence:
+            summary += f", {self.avg_cadence}spm"
+        
+        # v3.7.0: Adicionar elevação se disponível
+        if self.elevation_gain:
+            summary += f", D+{int(self.elevation_gain)}m"
+        
         summary += ")"
         return summary
     
-    def to_detailed_summary(self) -> str:
-        """Retorna resumo detalhado multi-linha (v3.7.0: + altimetria + cadência)"""
-        lines = [f"📅 {self.date} - {self.sport}"]
-        lines.append(f"  ⏱️ Duração: {self.duration_min}min")
+    def to_detailed_text(self) -> str:
+        """Retorna texto detalhado formatado"""
+        lines = [f"📅 {self.date or 'N/A'}"]
+        lines.append(f"🏃 {self.sport}")
+        lines.append(f"⏱️ {self.duration_min}min")
         
         if self.distance_km:
-            lines.append(f"  📏 Dist: {self.distance_km}km")
+            lines.append(f"📏 {self.distance_km}km")
         
-        # v3.7.0: Altimetria
+        if self.avg_hr:
+            lines.append(f"❤️ {self.avg_hr}bpm")
+        
+        if self.calories:
+            lines.append(f"🔥 {self.calories}kcal")
+        
+        # v3.7.0: Elevação
         if self.elevation_gain:
-            lines.append(f"  ⛰️ D+: {self.elevation_gain}m")
+            lines.append(f"⛰️ D+ {int(self.elevation_gain)}m")
+        
+        # v3.8.0: Cadência de ciclismo
+        if self.bike_cadence:
+            lines.append(f"🚴 {self.bike_cadence}rpm (cadência)")
+        
+        # v3.7.0: Cadência de corrida
+        if self.avg_cadence:
+            lines.append(f"👟 {self.avg_cadence}spm (cadência)")
+            if self.max_cadence:
+                lines.append(f"👟 Max: {self.max_cadence}spm")
         
         if self.intensity:
-            lines.append(f"  🎯 Zona: {self.intensity}")
+            lines.append(f"💪 {self.intensity}")
         
         if self.load:
-            lines.append(f"  💪 Load: {self.load}")
-        
-        # v3.7.0: Cadência (apenas para corrida)
-        if self.avg_cadence and "Corr" in self.sport:
-            lines.append(f"  👟 Cadência: {self.avg_cadence} spm")
-        
-        if self.avg_hr or self.calories:
-            detail = "  "
-            if self.avg_hr:
-                detail += f"💓 FC: {self.avg_hr}bpm"
-            if self.calories:
-                detail += f" 🔥 {self.calories}kcal"
-            lines.append(detail)
+            lines.append(f"📊 Carga: {self.load}")
         
         return "\n".join(lines)
 
-@dataclass
-class ContextEntry:
-    """Entrada de contexto conversacional"""
-    timestamp: str
-    analysis_type: str
-    prompt: str
-    response: str
-    user_input: Optional[str] = None
-
 # ==========================================
-# v3.6: CIRCUIT BREAKER
+# GLOBAL STATE (v3.8.0: + health check data)
 # ==========================================
 class CircuitBreaker:
-    """Circuit breaker para proteger contra falhas consecutivas"""
-    def __init__(self, threshold: int, timeout: int):
-        self.threshold = threshold
-        self.timeout = timeout
+    def __init__(self):
         self.failure_count = 0
-        self.last_failure_time = None
-        self.state = "closed"  # closed, open, half-open
+        self.last_failure_time = 0
+        self.state = 'closed'
+    
+    def can_attempt(self) -> bool:
+        if self.state == 'closed':
+            return True
+        
+        if time.time() - self.last_failure_time > CIRCUIT_BREAKER_TIMEOUT:
+            self.state = 'half-open'
+            return True
+        
+        return False
+    
+    def call_succeeded(self):
+        self.failure_count = 0
+        self.state = 'closed'
     
     def call_failed(self):
-        """Registra falha"""
         self.failure_count += 1
         self.last_failure_time = time.time()
         
-        if self.failure_count >= self.threshold:
-            self.state = "open"
+        if self.failure_count >= CIRCUIT_BREAKER_THRESHOLD:
+            self.state = 'open'
             logger.warning(f"Circuit breaker OPEN após {self.failure_count} falhas")
+
+class RateLimiter:
+    def __init__(self):
+        self.requests = defaultdict(list)
     
-    def call_succeeded(self):
-        """Registra sucesso"""
-        self.failure_count = 0
-        self.state = "closed"
-        logger.info("Circuit breaker CLOSED após sucesso")
-    
-    def can_attempt(self) -> bool:
-        """Verifica se pode tentar chamada"""
-        if self.state == "closed":
-            return True
+    def can_proceed(self, user_id: int) -> bool:
+        now = time.time()
+        user_requests = self.requests[user_id]
         
-        if self.state == "open":
-            # Verifica se timeout passou
-            if time.time() - self.last_failure_time > self.timeout:
-                self.state = "half-open"
-                logger.info("Circuit breaker HALF-OPEN (tentando recuperação)")
-                return True
+        # Remove requests antigos
+        user_requests = [t for t in user_requests if now - t < RATE_LIMIT_WINDOW]
+        self.requests[user_id] = user_requests
+        
+        if len(user_requests) >= RATE_LIMIT_MAX_REQUESTS:
             return False
         
-        # half-open: permite tentativa
+        user_requests.append(now)
         return True
 
-circuit_breaker = CircuitBreaker(CIRCUIT_BREAKER_THRESHOLD, CIRCUIT_BREAKER_TIMEOUT)
-
-# ==========================================
-# v3.6: RESPONSE CACHE
-# ==========================================
 class ResponseCache:
-    """Cache de respostas para evitar chamadas duplicadas"""
-    def __init__(self, max_size: int, ttl: int):
-        self.cache: Dict[str, Tuple[str, float]] = {}
-        self.max_size = max_size
-        self.ttl = ttl
+    def __init__(self):
+        self.cache = {}
+        self.timestamps = {}
+    
+    def make_key(self, prompt: str) -> str:
+        return hashlib.md5(prompt.encode()).hexdigest()
     
     def get(self, key: str) -> Optional[str]:
-        """Busca resposta no cache"""
         if key not in self.cache:
             return None
         
-        response, timestamp = self.cache[key]
-        
-        # Verifica TTL
-        if time.time() - timestamp > self.ttl:
+        if time.time() - self.timestamps[key] > CACHE_TTL_SECONDS:
             del self.cache[key]
+            del self.timestamps[key]
             return None
         
-        logger.info(f"Cache HIT: {key[:50]}...")
-        return response
+        return self.cache[key]
     
     def set(self, key: str, value: str):
-        """Armazena resposta no cache"""
-        # Limita tamanho do cache
-        if len(self.cache) >= self.max_size:
-            # Remove entrada mais antiga
-            oldest_key = min(self.cache.keys(), key=lambda k: self.cache[k][1])
+        if len(self.cache) >= RESPONSE_CACHE_SIZE:
+            oldest_key = min(self.timestamps.keys(), key=lambda k: self.timestamps[k])
             del self.cache[oldest_key]
+            del self.timestamps[oldest_key]
         
-        self.cache[key] = (value, time.time())
-        logger.info(f"Cache SET: {key[:50]}...")
+        self.cache[key] = value
+        self.timestamps[key] = time.time()
+
+# v3.8.0: Health Check State
+class HealthCheckState:
+    def __init__(self):
+        self.gemini_latencies = []  # Últimas latências em segundos
+        self.last_check_time = 0
+        self.last_disk_check = None
+        self.last_integrity_check = None
     
-    def make_key(self, prompt: str) -> str:
-        """Cria chave de cache a partir do prompt"""
-        return hashlib.md5(prompt.encode()).hexdigest()
-
-response_cache = ResponseCache(RESPONSE_CACHE_SIZE, CACHE_TTL_SECONDS)
-
-# ==========================================
-# v3.6: RATE LIMITER
-# ==========================================
-class RateLimiter:
-    """Rate limiter por usuário"""
-    def __init__(self, window: int, max_requests: int):
-        self.window = window
-        self.max_requests = max_requests
-        self.requests: Dict[int, List[float]] = defaultdict(list)
+    def record_gemini_latency(self, latency: float):
+        """Regista latência de chamada ao Gemini"""
+        self.gemini_latencies.append(latency)
+        if len(self.gemini_latencies) > GEMINI_LATENCY_HISTORY_SIZE:
+            self.gemini_latencies.pop(0)
     
-    def can_proceed(self, user_id: int) -> bool:
-        """Verifica se usuário pode fazer request"""
-        now = time.time()
-        
-        # Remove requests antigos
-        self.requests[user_id] = [
-            ts for ts in self.requests[user_id]
-            if now - ts < self.window
-        ]
-        
-        # Verifica limite
-        if len(self.requests[user_id]) >= self.max_requests:
-            logger.warning(f"Rate limit excedido para user {user_id}")
-            return False
-        
-        # Registra novo request
-        self.requests[user_id].append(now)
-        return True
+    def get_avg_gemini_latency(self) -> Optional[float]:
+        """Retorna latência média do Gemini"""
+        if not self.gemini_latencies:
+            return None
+        return round(mean(self.gemini_latencies), 2)
 
-rate_limiter = RateLimiter(RATE_LIMIT_WINDOW, RATE_LIMIT_MAX_REQUESTS)
+# Global instances
+circuit_breaker = CircuitBreaker()
+rate_limiter = RateLimiter()
+response_cache = ResponseCache()
+health_state = HealthCheckState()  # v3.8.0
 
 # ==========================================
-# FILE OPERATIONS
+# FILESYSTEM OPERATIONS (v3.8.0: BLINDAGEM CRÍTICA)
 # ==========================================
 def ensure_data_dir():
-    """Garante que o diretório de dados existe"""
+    """Garante que DATA_DIR existe"""
     os.makedirs(DATA_DIR, exist_ok=True)
 
 def load_garmin_data() -> Optional[Dict]:
@@ -401,7 +399,10 @@ def load_garmin_data() -> Optional[Dict]:
         return None
 
 def load_activities_index() -> Dict:
-    """Carrega índice de atividades"""
+    """
+    Carrega índice de atividades
+    v3.8.0: BLINDAGEM - Converte list para dict se necessário
+    """
     ensure_data_dir()
     try:
         path = os.path.join(DATA_DIR, 'activities.json')
@@ -409,31 +410,110 @@ def load_activities_index() -> Dict:
             return {}
         
         with open(path, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            data = json.load(f)
+        
+        # v3.8.0: BLINDAGEM CRÍTICA - Se for lista, converte para dict
+        if isinstance(data, list):
+            logger.warning("⚠️ activities.json é uma lista! Convertendo para dict...")
+            converted = {}
+            for item in data:
+                if isinstance(item, dict) and 'id' in item:
+                    converted[str(item['id'])] = item
+                elif isinstance(item, dict) and 'activityId' in item:
+                    converted[str(item['activityId'])] = item
+            
+            logger.info(f"✅ Convertidos {len(converted)} itens de list para dict")
+            
+            # Salva imediatamente no formato correto
+            save_activities_index(converted)
+            return converted
+        
+        # Se já for dict, retorna normalmente
+        if isinstance(data, dict):
+            return data
+        
+        # Se não for nem list nem dict, retorna vazio e loga erro
+        logger.error(f"❌ activities.json tem tipo inválido: {type(data)}")
+        return {}
+        
     except Exception as e:
         logger.error(f"Erro ao carregar activities.json: {e}")
         return {}
 
 def save_activities_index(activities: Dict):
-    """Salva índice de atividades"""
+    """
+    Salva índice de atividades
+    v3.8.0: ATOMIC WRITE + VALIDAÇÃO - Garante que sempre salva dict
+    """
     ensure_data_dir()
+    
+    # v3.8.0: VALIDAÇÃO PRÉ-ESCRITA
+    if not isinstance(activities, dict):
+        logger.error(f"❌ CRÍTICO: Tentativa de salvar activities como {type(activities)}")
+        raise FileOperationError(f"Activities deve ser dict, não {type(activities)}")
+    
     try:
         path = os.path.join(DATA_DIR, 'activities.json')
-        with open(path, 'w', encoding='utf-8') as f:
+        temp_path = path + '.tmp'
+        
+        # v3.8.0: ATOMIC WRITE - Escreve para ficheiro temporário primeiro
+        with open(temp_path, 'w', encoding='utf-8') as f:
             json.dump(activities, f, ensure_ascii=False, indent=2)
+        
+        # Move atomicamente (substitui o original)
+        os.replace(temp_path, path)
+        
+        logger.debug(f"✅ activities.json salvo com {len(activities)} entradas")
+        
     except Exception as e:
         logger.error(f"Erro ao salvar activities.json: {e}")
+        # Remove ficheiro temporário se existir
+        temp_path = os.path.join(DATA_DIR, 'activities.json.tmp')
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except:
+                pass
         raise FileOperationError(f"Falha ao salvar atividades: {e}")
 
-def check_disk_space() -> bool:
-    """Verifica se há espaço em disco suficiente"""
+def check_disk_space() -> Tuple[bool, float]:
+    """
+    Verifica espaço em disco
+    v3.8.0: Retorna também o espaço disponível para health check
+    """
     try:
         stat = os.statvfs(DATA_DIR)
         free_mb = (stat.f_bavail * stat.f_frsize) / (1024 * 1024)
-        return free_mb >= MIN_DISK_SPACE_MB
+        return free_mb >= MIN_DISK_SPACE_MB, free_mb
     except Exception as e:
         logger.error(f"Erro ao verificar espaço em disco: {e}")
-        return True  # Assume OK se não conseguir verificar
+        return True, -1  # Assume OK se não conseguir verificar
+
+def check_activities_integrity() -> Tuple[bool, str]:
+    """
+    v3.8.0: Verifica integridade do activities.json
+    Retorna (is_valid, status_message)
+    """
+    try:
+        path = os.path.join(DATA_DIR, 'activities.json')
+        
+        if not os.path.exists(path):
+            return True, "Ficheiro não existe (OK)"
+        
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        if isinstance(data, dict):
+            return True, f"Dict válido com {len(data)} entradas"
+        elif isinstance(data, list):
+            return False, f"CORRUPTO: É lista com {len(data)} itens (será corrigido no próximo load)"
+        else:
+            return False, f"CORRUPTO: Tipo inválido {type(data)}"
+            
+    except json.JSONDecodeError as e:
+        return False, f"JSON INVÁLIDO: {str(e)[:50]}"
+    except Exception as e:
+        return False, f"ERRO: {str(e)[:50]}"
 
 # ==========================================
 # FLAG MANAGEMENT
@@ -512,15 +592,11 @@ def create_sync_request() -> bool:
     return create_flag('sync_request')
 
 # ==========================================
-# DATA EXTRACTION (v3.7.0: + ALTIMETRIA + CADÊNCIA)
+# DATA EXTRACTION (v3.8.0: + CADÊNCIA CICLISMO)
 # ==========================================
 def extract_elevation_from_raw(raw_data: Dict, sport: str) -> Optional[float]:
-    """
-    Extrai ganho de elevação do JSON raw da Garmin
-    v3.7.0: Nova função para extrair altimetria
-    """
+    """Extrai ganho de elevação do JSON raw da Garmin"""
     try:
-        # Garmin pode usar diferentes campos dependendo do tipo de atividade
         elevation_fields = [
             'totalElevationGain',
             'elevationGain', 
@@ -531,7 +607,6 @@ def extract_elevation_from_raw(raw_data: Dict, sport: str) -> Optional[float]:
         for field in elevation_fields:
             if field in raw_data and raw_data[field] is not None:
                 value = raw_data[field]
-                # Converter para metros se necessário
                 if isinstance(value, (int, float)):
                     return round(float(value), 1)
         
@@ -540,17 +615,12 @@ def extract_elevation_from_raw(raw_data: Dict, sport: str) -> Optional[float]:
         logger.debug(f"Erro ao extrair elevação: {e}")
         return None
 
-def extract_cadence_from_raw(raw_data: Dict, sport: str) -> Tuple[Optional[int], Optional[int]]:
-    """
-    Extrai cadência média e máxima do JSON raw da Garmin
-    v3.7.0: Nova função para extrair cadência (especialmente para corrida)
-    """
+def extract_run_cadence_from_raw(raw_data: Dict, sport: str) -> Tuple[Optional[int], Optional[int]]:
+    """Extrai cadência de corrida (spm) do JSON raw da Garmin"""
     try:
         avg_cadence = None
         max_cadence = None
         
-        # Para corrida, Garmin reporta em strides per minute (divide por 2 para obter steps per minute)
-        # ou já em steps per minute dependendo do modelo
         if "Corr" in sport or "Run" in sport:
             cadence_fields_avg = ['averageRunCadence', 'avgRunCadence', 'averageCadence']
             cadence_fields_max = ['maxRunCadence', 'maxCadence']
@@ -558,8 +628,6 @@ def extract_cadence_from_raw(raw_data: Dict, sport: str) -> Tuple[Optional[int],
             for field in cadence_fields_avg:
                 if field in raw_data and raw_data[field] is not None:
                     value = raw_data[field]
-                    # Se valor está entre 80-100, provavelmente é strides/min (multiply by 2)
-                    # Se está entre 160-200, já é steps/min
                     if isinstance(value, (int, float)):
                         if value < 120:  # Provavelmente strides per minute
                             avg_cadence = int(value * 2)
@@ -579,61 +647,94 @@ def extract_cadence_from_raw(raw_data: Dict, sport: str) -> Tuple[Optional[int],
         
         return avg_cadence, max_cadence
     except Exception as e:
-        logger.debug(f"Erro ao extrair cadência: {e}")
+        logger.debug(f"Erro ao extrair cadência de corrida: {e}")
         return None, None
 
+def extract_bike_cadence_from_raw(raw_data: Dict, sport: str) -> Optional[int]:
+    """
+    v3.8.0: Extrai cadência de ciclismo (rpm) do JSON raw da Garmin
+    """
+    try:
+        # Verifica se é ciclismo
+        if not any(x in sport for x in ['Cicl', 'MTB', 'Spin', 'Bike', 'Cycling']):
+            return None
+        
+        # Campos possíveis para cadência de ciclismo
+        bike_cadence_fields = [
+            'averageBikingCadenceInRevolutionsPerMinute',
+            'avgBikeCadence',
+            'averageCadence',
+            'cadence'
+        ]
+        
+        for field in bike_cadence_fields:
+            if field in raw_data and raw_data[field] is not None:
+                value = raw_data[field]
+                if isinstance(value, (int, float)):
+                    # Cadência de ciclismo já deve estar em RPM
+                    return int(value)
+        
+        return None
+    except Exception as e:
+        logger.debug(f"Erro ao extrair cadência de ciclismo: {e}")
+        return None
+
 def needs_data_enrichment(activity: Dict) -> bool:
-    """
-    Verifica se atividade precisa de enriquecimento de dados
-    v3.7.0: Nova função para detectar dados em falta
-    """
+    """Verifica se atividade precisa de enriquecimento de dados"""
     sport = activity.get('sport', '')
     
-    # Verifica se é ciclismo ou corrida (atividades que devem ter altimetria)
     is_cycling = any(x in sport for x in ['Cicl', 'MTB', 'Spin', 'Bike'])
     is_running = any(x in sport for x in ['Corr', 'Run'])
     
     missing_elevation = (is_cycling or is_running) and activity.get('elevation_gain') is None
-    missing_cadence = is_running and activity.get('avg_cadence') is None
+    missing_run_cadence = is_running and activity.get('avg_cadence') is None
+    missing_bike_cadence = is_cycling and activity.get('bike_cadence') is None  # v3.8.0
     
-    return missing_elevation or missing_cadence
+    return missing_elevation or missing_run_cadence or missing_bike_cadence
 
-def enrich_activity_from_garmin(activity_id: str, garmin_data: Dict) -> Dict:
+def enrich_activity_from_garmin(activity_id: str, garmin_data: Dict) -> Optional[Dict]:
     """
-    Re-extrai dados de uma atividade específica do JSON da Garmin
-    v3.7.0: Nova função para retrocompatibilidade
+    Enriquece atividade com dados adicionais do Garmin
+    v3.8.0: Inclui cadência de ciclismo
     """
     try:
-        # Procura atividade no garmin_dump.json
-        activities_list = garmin_data.get('activities', [])
+        activities = garmin_data.get('activities', [])
         
-        for raw_act in activities_list:
-            if str(raw_act.get('activityId')) == str(activity_id):
-                sport = raw_act.get('activityType', {}).get('typeKey', 'Unknown')
+        for act in activities:
+            if str(act.get('activityId')) == str(activity_id):
+                sport_data = act.get('activityType', {})
+                sport = sport_data.get('typeKey', 'Unknown')
                 
-                # Extrai novos dados
-                elevation = extract_elevation_from_raw(raw_act, sport)
-                avg_cad, max_cad = extract_cadence_from_raw(raw_act, sport)
+                enrichment = {}
                 
-                enriched = {
-                    'elevation_gain': elevation,
-                    'avg_cadence': avg_cad,
-                    'max_cadence': max_cad
-                }
+                # Extrai elevação
+                elevation = extract_elevation_from_raw(act, sport)
+                if elevation is not None:
+                    enrichment['elevation_gain'] = elevation
                 
-                logger.info(f"Atividade {activity_id} enriquecida: elevation={elevation}m, cadence={avg_cad}spm")
-                return enriched
+                # Extrai cadência de corrida
+                avg_cad, max_cad = extract_run_cadence_from_raw(act, sport)
+                if avg_cad is not None:
+                    enrichment['avg_cadence'] = avg_cad
+                if max_cad is not None:
+                    enrichment['max_cadence'] = max_cad
+                
+                # v3.8.0: Extrai cadência de ciclismo
+                bike_cad = extract_bike_cadence_from_raw(act, sport)
+                if bike_cad is not None:
+                    enrichment['bike_cadence'] = bike_cad
+                
+                return enrichment if enrichment else None
         
-        logger.warning(f"Atividade {activity_id} não encontrada no garmin_dump.json")
-        return {}
+        return None
     except Exception as e:
         logger.error(f"Erro ao enriquecer atividade {activity_id}: {e}")
-        return {}
+        return None
 
 def check_and_enrich_activities():
     """
-    Verifica todas as atividades e enriquece as que precisam
-    v3.7.0: Nova função de manutenção automática
+    Verifica e enriquece atividades que precisam de dados adicionais
+    v3.8.0: Inclui cadência de ciclismo
     """
     try:
         activities = load_activities_index()
@@ -705,10 +806,7 @@ def get_recent_biometrics(days: int = 7) -> List[BiometricDay]:
     return history[:days]
 
 def calculate_biometric_baseline(history: List[BiometricDay]) -> Dict[str, float]:
-    """
-    Calcula baseline biométrico
-    v3.7.0: Função crítica para contexto biométrico
-    """
+    """Calcula baseline biométrico"""
     if not history:
         return {}
     
@@ -734,10 +832,10 @@ def calculate_biometric_baseline(history: List[BiometricDay]) -> Dict[str, float
 def format_biometric_context(history: List[BiometricDay], baseline: Dict) -> str:
     """
     Formata contexto biométrico para o prompt do Gemini
-    v3.7.0: CRÍTICO - Injecção de biometria no prompt
+    v3.8.0: OBRIGATÓRIO em todos os fluxos de análise
     """
     if not history or not baseline:
-        return "⚠️ DADOS BIOMÉTRICOS INSUFICIENTES"
+        return "⚠️ DADOS BIOMÉTRICOS INSUFICIENTES - Usar médias históricas como referência"
     
     latest = history[0]
     
@@ -779,7 +877,7 @@ def format_biometric_context(history: List[BiometricDay], baseline: Dict) -> str
 def parse_activities_from_garmin(data: Dict) -> List[Dict]:
     """
     Parse atividades do JSON da Garmin
-    v3.7.0: Expandido para extrair altimetria e cadência
+    v3.8.0: Expandido para extrair cadência de ciclismo
     """
     activities = []
     
@@ -805,11 +903,14 @@ def parse_activities_from_garmin(data: Dict) -> List[Dict]:
             avg_hr = act.get('averageHR')
             calories = act.get('calories')
             
-            # v3.7.0: Extrair altimetria
+            # Extrair altimetria
             elevation_gain = extract_elevation_from_raw(act, sport)
             
-            # v3.7.0: Extrair cadência
-            avg_cadence, max_cadence = extract_cadence_from_raw(act, sport)
+            # Extrair cadência de corrida
+            avg_cadence, max_cadence = extract_run_cadence_from_raw(act, sport)
+            
+            # v3.8.0: Extrair cadência de ciclismo
+            bike_cadence = extract_bike_cadence_from_raw(act, sport)
             
             activity = {
                 'id': str(activity_id),
@@ -819,9 +920,10 @@ def parse_activities_from_garmin(data: Dict) -> List[Dict]:
                 'distance_km': distance_km,
                 'avg_hr': avg_hr,
                 'calories': calories,
-                'elevation_gain': elevation_gain,  # v3.7.0
-                'avg_cadence': avg_cadence,        # v3.7.0
-                'max_cadence': max_cadence,        # v3.7.0
+                'elevation_gain': elevation_gain,
+                'avg_cadence': avg_cadence,
+                'max_cadence': max_cadence,
+                'bike_cadence': bike_cadence,  # v3.8.0
                 'raw': act
             }
             
@@ -838,10 +940,15 @@ def parse_activities_from_garmin(data: Dict) -> List[Dict]:
 def get_all_formatted_activities() -> List[FormattedActivity]:
     """
     Retorna todas as atividades formatadas
-    v3.7.0: Inclui novos campos (altimetria + cadência)
+    v3.8.0: RESILIÊNCIA - Converte list para dict se necessário
     """
-    activities_index = load_activities_index()
+    activities_index = load_activities_index()  # Já faz a conversão se for list
     formatted = []
+    
+    # v3.8.0: VALIDAÇÃO ADICIONAL
+    if not isinstance(activities_index, dict):
+        logger.error(f"❌ activities_index não é dict: {type(activities_index)}")
+        return []
     
     for activity_id, activity_data in activities_index.items():
         try:
@@ -854,9 +961,10 @@ def get_all_formatted_activities() -> List[FormattedActivity]:
                 calories=activity_data.get('calories'),
                 intensity=activity_data.get('intensity'),
                 load=activity_data.get('load'),
-                elevation_gain=activity_data.get('elevation_gain'),  # v3.7.0
-                avg_cadence=activity_data.get('avg_cadence'),        # v3.7.0
-                max_cadence=activity_data.get('max_cadence'),        # v3.7.0
+                elevation_gain=activity_data.get('elevation_gain'),
+                avg_cadence=activity_data.get('avg_cadence'),
+                max_cadence=activity_data.get('max_cadence'),
+                bike_cadence=activity_data.get('bike_cadence'),  # v3.8.0
                 raw=activity_data.get('raw', {})
             )
             formatted.append(formatted_act)
@@ -915,12 +1023,12 @@ def reorganize_activities() -> Tuple[int, int, List[str]]:
         return 0, 0, messages
 
 # ==========================================
-# GEMINI API (v3.7.0: RETRY INTELIGENTE)
+# GEMINI API (v3.8.0: LATENCY TRACKING)
 # ==========================================
 async def call_gemini_with_retry(prompt: str, user_id: int) -> str:
     """
     Chama Gemini com retry inteligente
-    v3.7.0: Delays maiores após timeout, backoff exponencial
+    v3.8.0: Adiciona tracking de latência para health check
     """
     # Check circuit breaker
     if not circuit_breaker.can_attempt():
@@ -945,70 +1053,57 @@ async def call_gemini_with_retry(prompt: str, user_id: int) -> str:
             if attempt > 0:
                 delay = RETRY_DELAYS[attempt - 1]
                 
-                # v3.7.0: Se última tentativa foi timeout, usa delay maior
+                # Se última tentativa foi timeout, usa delay maior
                 if was_timeout:
-                    delay = delay * 2  # Dobra o delay após timeout
-                    logger.info(f"Timeout detectado, delay aumentado para {delay}s")
+                    delay = delay * 2
+                    logger.info(f"Timeout anterior. Delay aumentado para {delay}s")
                 
-                logger.info(f"Retry {attempt}/{MAX_RETRIES} após {delay}s")
+                logger.info(f"Retry {attempt}/{MAX_RETRIES} após {delay}s...")
                 await asyncio.sleep(delay)
             
-            logger.info(f"Chamando Gemini (tentativa {attempt + 1}/{MAX_RETRIES})...")
+            # v3.8.0: Medir latência
+            start_time = time.time()
             
-            # v3.7.0: Timeout aumentado para 45s
             response = await asyncio.wait_for(
                 asyncio.to_thread(model.generate_content, prompt),
                 timeout=GEMINI_TIMEOUT_SECONDS
             )
             
+            # v3.8.0: Registar latência
+            latency = time.time() - start_time
+            health_state.record_gemini_latency(latency)
+            
             if not response or not response.text:
-                raise ValueError("Resposta vazia do Gemini")
+                raise Exception("Resposta vazia do Gemini")
             
             result = response.text.strip()
             
-            # Sucesso: atualiza circuit breaker e cache
-            circuit_breaker.call_succeeded()
+            # Cache e sucesso
             response_cache.set(cache_key, result)
+            circuit_breaker.call_succeeded()
             
-            logger.info(f"✅ Gemini respondeu ({len(result)} chars)")
+            if attempt > 0:
+                logger.info(f"✅ Sucesso no retry {attempt}")
+            
             return result
             
         except asyncio.TimeoutError:
-            was_timeout = True  # v3.7.0: Flag para ajustar próximo delay
+            was_timeout = True
             last_error = GeminiTimeoutError(f"Timeout após {GEMINI_TIMEOUT_SECONDS}s")
-            logger.warning(f"Timeout na tentativa {attempt + 1}")
+            logger.warning(f"⏱️ Timeout na tentativa {attempt + 1}")
+            circuit_breaker.call_failed()
             
         except Exception as e:
             was_timeout = False
             last_error = e
-            logger.error(f"Erro na tentativa {attempt + 1}: {e}")
+            logger.error(f"❌ Erro na tentativa {attempt + 1}: {e}")
+            circuit_breaker.call_failed()
     
     # Todas as tentativas falharam
-    circuit_breaker.call_failed()
-    
     if isinstance(last_error, GeminiTimeoutError):
         raise last_error
     else:
-        raise Exception(f"Gemini falhou após {MAX_RETRIES} tentativas: {last_error}")
-
-def truncate_prompt_if_needed(prompt: str, max_length: int = GEMINI_MAX_PROMPT_LENGTH) -> str:
-    """Trunca prompt se exceder limite"""
-    if len(prompt) <= max_length:
-        return prompt
-    
-    logger.warning(f"Prompt muito grande ({len(prompt)} chars), truncando...")
-    
-    # Mantém início e fim, remove meio
-    keep_start = int(max_length * 0.4)
-    keep_end = int(max_length * 0.4)
-    
-    truncated = (
-        prompt[:keep_start] + 
-        f"\n\n[... {len(prompt) - max_length} caracteres removidos ...]\n\n" + 
-        prompt[-keep_end:]
-    )
-    
-    return truncated
+        raise Exception(f"Falha após {MAX_RETRIES} tentativas: {last_error}")
 
 # ==========================================
 # CONTEXT MANAGEMENT
@@ -1016,620 +1111,555 @@ def truncate_prompt_if_needed(prompt: str, max_length: int = GEMINI_MAX_PROMPT_L
 def get_context_path(user_id: int) -> str:
     """Retorna caminho do arquivo de contexto do usuário"""
     ensure_data_dir()
-    contexts_dir = os.path.join(DATA_DIR, 'contexts')
-    os.makedirs(contexts_dir, exist_ok=True)
-    return os.path.join(contexts_dir, f"{user_id}.json")
+    return os.path.join(DATA_DIR, f'context_{user_id}.json')
 
 def load_context_from_disk(user_id: int) -> Optional[Dict]:
     """Carrega contexto do disco"""
+    path = get_context_path(user_id)
+    
+    if not os.path.exists(path):
+        return None
+    
     try:
-        path = get_context_path(user_id)
-        if not os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # Verifica se contexto expirou
+        last_activity = data.get('last_activity', 0)
+        if time.time() - last_activity > CONTEXT_TIMEOUT_MINUTES * 60:
+            os.remove(path)
             return None
         
-        with open(path, 'r', encoding='utf-8') as f:
-            return json.load(f)
+        return data
     except Exception as e:
-        logger.error(f"Erro ao carregar contexto de {user_id}: {e}")
+        logger.error(f"Erro ao carregar contexto: {e}")
         return None
 
 def save_context_to_disk(user_id: int, context_data: Dict):
     """Salva contexto no disco"""
+    path = get_context_path(user_id)
+    
     try:
-        path = get_context_path(user_id)
+        context_data['last_activity'] = time.time()
+        
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(context_data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.error(f"Erro ao salvar contexto de {user_id}: {e}")
+        logger.error(f"Erro ao salvar contexto: {e}")
 
 def clear_context_disk(user_id: int) -> bool:
-    """Remove arquivo de contexto"""
-    try:
-        path = get_context_path(user_id)
-        if os.path.exists(path):
+    """Remove contexto do disco"""
+    path = get_context_path(user_id)
+    
+    if os.path.exists(path):
+        try:
             os.remove(path)
             return True
-        return False
-    except Exception as e:
-        logger.error(f"Erro ao limpar contexto de {user_id}: {e}")
-        return False
+        except Exception as e:
+            logger.error(f"Erro ao remover contexto: {e}")
+            return False
+    
+    return False
 
-def add_to_context(user_id: int, analysis_type: str, prompt: str, response: str, user_input: Optional[str] = None):
-    """Adiciona entrada ao contexto"""
-    context_data = load_context_from_disk(user_id) or {'history': [], 'last_updated': None}
+def add_to_context_history(user_id: int, analysis_type: str, prompt: str, response: str):
+    """Adiciona entrada ao histórico de contexto"""
+    context_data = load_context_from_disk(user_id) or {
+        'user_id': user_id,
+        'history': [],
+        'last_activity': time.time()
+    }
     
-    entry = ContextEntry(
-        timestamp=datetime.now().isoformat(),
-        analysis_type=analysis_type,
-        prompt=prompt,
-        response=response,
-        user_input=user_input
-    )
+    entry = {
+        'timestamp': datetime.now().isoformat(),
+        'analysis_type': analysis_type,
+        'prompt': prompt[:500],  # Limita tamanho
+        'response': response[:1000]
+    }
     
-    context_data['history'].append(asdict(entry))
-    context_data['last_updated'] = datetime.now().isoformat()
+    context_data['history'].append(entry)
     
-    # Limita histórico
+    # Limita tamanho do histórico
     if len(context_data['history']) > MAX_CONTEXT_HISTORY:
         context_data['history'] = context_data['history'][-MAX_CONTEXT_HISTORY:]
     
     save_context_to_disk(user_id, context_data)
 
+def get_context_for_followup(user_id: int) -> str:
+    """Obtém contexto formatado para follow-up"""
+    context_data = load_context_from_disk(user_id)
+    
+    if not context_data or not context_data.get('history'):
+        return ""
+    
+    history = context_data['history']
+    
+    context_lines = ["### CONTEXTO DAS ANÁLISES ANTERIORES:"]
+    
+    for i, entry in enumerate(history, 1):
+        context_lines.append(f"\n**Análise {i} ({entry['analysis_type']}):**")
+        context_lines.append(entry['response'][:500])
+    
+    return "\n".join(context_lines)
+
 def get_context_stats() -> Dict:
-    """Retorna estatísticas dos contextos"""
+    """Retorna estatísticas de contexto"""
     try:
-        contexts_dir = os.path.join(DATA_DIR, 'contexts')
-        if not os.path.exists(contexts_dir):
-            return {'total_users': 0, 'by_type': {}}
+        ensure_data_dir()
         
         total_users = 0
-        analysis_counts = defaultdict(int)
+        by_type = defaultdict(int)
         
-        for file in os.listdir(contexts_dir):
-            if not file.endswith('.json'):
+        for file in os.listdir(DATA_DIR):
+            if not file.startswith('context_'):
                 continue
             
-            total_users += 1
+            path = os.path.join(DATA_DIR, file)
             
             try:
-                with open(os.path.join(contexts_dir, file), 'r') as f:
+                with open(path, 'r') as f:
                     data = json.load(f)
-                    for entry in data.get('history', []):
-                        analysis_type = entry.get('analysis_type', 'unknown')
-                        analysis_counts[analysis_type] += 1
+                
+                total_users += 1
+                
+                for entry in data.get('history', []):
+                    analysis_type = entry.get('analysis_type', 'unknown')
+                    by_type[analysis_type] += 1
             except:
-                pass
+                continue
         
         return {
             'total_users': total_users,
-            'by_type': dict(analysis_counts)
+            'by_type': dict(by_type)
         }
     except Exception as e:
         return {'error': str(e)}
 
-def build_conversational_prompt(user_id: int, user_message: str) -> str:
-    """Constrói prompt conversacional com contexto"""
-    context_data = load_context_from_disk(user_id)
-    
-    if not context_data or not context_data.get('history'):
-        return f"Pergunta sem contexto prévio:\n\n{user_message}"
-    
-    # Verifica timeout
-    last_updated = context_data.get('last_updated')
-    if last_updated:
-        try:
-            last_time = datetime.fromisoformat(last_updated)
-            if datetime.now() - last_time > timedelta(minutes=CONTEXT_TIMEOUT_MINUTES):
-                return f"Contexto expirado. Pergunta:\n\n{user_message}"
-        except:
-            pass
-    
-    # Constrói prompt com histórico
-    prompt_parts = ["Histórico da conversa (responde com base neste contexto):\n"]
-    
-    for entry in context_data['history'][-MAX_CONTEXT_HISTORY:]:
-        analysis_type = entry.get('analysis_type', '')
-        timestamp = entry.get('timestamp', '')
-        user_input = entry.get('user_input', '')
-        
-        prompt_parts.append(f"\n--- {analysis_type} ({timestamp[:16]}) ---")
-        if user_input:
-            prompt_parts.append(f"Input do usuário: {user_input}")
-    
-    prompt_parts.append(f"\n\n--- NOVA PERGUNTA ---")
-    prompt_parts.append(user_message)
-    
-    return "\n".join(prompt_parts)
-
 # ==========================================
-# TELEGRAM HANDLERS
+# TELEGRAM COMMAND HANDLERS
 # ==========================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler /start"""
     await update.message.reply_text(
-        f"🏋️ FitnessJournal v{BOT_VERSION}\n\n"
-        "Comandos:\n"
+        f"🏋️ FitnessJournal Bot v{BOT_VERSION}\n\n"
+        f"{BOT_VERSION_DESC}\n\n"
+        "Comandos principais:\n"
         "/status - Avalia readiness\n"
-        "/analyze - Analisa aderência ao plano\n"
-        "/analyze_activity - Analisa atividade individual\n"
+        "/analyze - Aderência ao plano\n"
+        "/analyze_activity - Analisa atividade\n"
         "/activities - Lista atividades\n"
-        "/history - Análises anteriores\n"
         "/help - Ajuda completa"
     )
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Handler /status
-    v3.7.0: INJETA BIOMETRIA NO PROMPT
+    Handler /status - Avalia readiness do atleta
+    v3.8.0: BIOMETRIA OBRIGATÓRIA
     """
     user_id = update.effective_user.id
     
-    msg = await update.message.reply_text("🔍 A analisar...")
-    
     try:
-        # Obtém dados biométricos
+        await update.message.reply_text("🔍 Avaliando readiness...")
+        
+        # v3.8.0: BIOMETRIA OBRIGATÓRIA
         history = get_recent_biometrics(7)
-        if not history:
-            await msg.edit_text("❌ Sem dados biométricos. Faz /sync primeiro.")
-            return
-        
-        # v3.7.0: Calcula baseline e formata contexto
         baseline = calculate_biometric_baseline(history)
-        biometric_context = format_biometric_context(history, baseline)
+        bio_context = format_biometric_context(history, baseline)
         
-        # Obtém atividades recentes
-        all_activities = get_all_formatted_activities()
-        recent = all_activities[:MAX_ACTIVITIES_IN_ANALYSIS]
+        activities = get_all_formatted_activities()
+        recent = activities[:MAX_ACTIVITIES_DISPLAY]
         
-        # Constrói prompt COM BIOMETRIA
-        prompt = f"""Analisa o estado de readiness do atleta.
+        prompt = f"""
+{bio_context}
 
-{biometric_context}
+### ATIVIDADES RECENTES (Últimas {len(recent)}):
 
-ATIVIDADES RECENTES ({len(recent)}):
 """
         
         for act in recent:
-            prompt += f"\n{act.to_brief_summary()}"
+            prompt += f"- {act.to_brief_summary()}\n"
         
-        prompt += "\n\nDá recomendação de treino para hoje baseada em:"
-        prompt += "\n1. Estado biométrico (HRV/RHR) - PRIORIDADE MÁXIMA"
-        prompt += "\n2. Carga de treino recente"
-        prompt += "\n3. Padrão de recuperação"
-        
-        # Chama Gemini com retry inteligente
-        response = await call_gemini_with_retry(prompt, user_id)
-        
-        # Salva contexto
-        add_to_context(user_id, 'status', prompt, response)
-        
-        # Envia resposta (pode ser dividida se muito grande)
-        await send_long_message(msg, response)
-        
-    except RateLimitExceeded as e:
-        await msg.edit_text(f"⏳ {str(e)}")
-    except CircuitBreakerOpen:
-        await msg.edit_text("⚠️ Serviço temporariamente indisponível. Tenta em 1 minuto.")
-    except GeminiTimeoutError:
-        await msg.edit_text("⏱️ Timeout ao analisar. Tenta novamente.")
-    except Exception as e:
-        logger.error(f"Erro em /status: {e}\n{traceback.format_exc()}")
-        await msg.edit_text("❌ Erro na análise.")
+        prompt += """
 
-async def send_long_message(message_obj, text: str):
-    """Envia mensagem longa dividindo se necessário"""
-    if len(text) <= TELEGRAM_SAFE_MESSAGE_LENGTH:
-        try:
-            await message_obj.edit_text(text)
-        except BadRequest:
-            # Se falhar, tenta sem edit
-            await message_obj.reply_text(text)
-        return
-    
-    # Divide em partes
-    parts = []
-    current_part = ""
-    
-    for line in text.split('\n'):
-        if len(current_part) + len(line) + 1 > TELEGRAM_SAFE_MESSAGE_LENGTH:
-            parts.append(current_part)
-            current_part = line
-        else:
-            current_part += '\n' + line if current_part else line
-    
-    if current_part:
-        parts.append(current_part)
-    
-    # Envia primeira parte como edit
-    try:
-        await message_obj.edit_text(parts[0])
-    except BadRequest:
-        await message_obj.reply_text(parts[0])
-    
-    # Envia resto como mensagens novas
-    for part in parts[1:]:
-        await message_obj.reply_text(part)
-
-async def activities_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lista atividades recentes"""
-    all_activities = get_all_formatted_activities()
-    
-    if not all_activities:
-        await update.message.reply_text("📭 Sem atividades. Faz /sync primeiro.")
-        return
-    
-    # v3.7.0: Mostra novos campos (altimetria + cadência)
-    recent = all_activities[:MAX_ACTIVITIES_DISPLAY]
-    
-    msg = f"🏃 ATIVIDADES RECENTES ({len(recent)}/{len(all_activities)}):\n\n"
-    
-    for i, act in enumerate(recent, 1):
-        msg += f"{i}. {act.to_detailed_summary()}\n\n"
-    
-    msg += f"💡 Usa /analyze_activity para análise detalhada."
-    
-    await update.message.reply_text(msg)
-
-async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handler /analyze - Aderência ao plano
-    v3.7.0: INJETA BIOMETRIA NO PROMPT
-    """
-    user_id = update.effective_user.id
-    
-    msg = await update.message.reply_text("🔍 A analisar aderência...")
-    
-    try:
-        # Obtém biometria
-        history = get_recent_biometrics(7)
-        baseline = calculate_biometric_baseline(history)
-        biometric_context = format_biometric_context(history, baseline)
-        
-        # Obtém atividades
-        all_activities = get_all_formatted_activities()
-        if len(all_activities) < 3:
-            await msg.edit_text("❌ Preciso de pelo menos 3 atividades para analisar aderência.")
-            return
-        
-        recent = all_activities[:MAX_ACTIVITIES_IN_ANALYSIS]
-        
-        # Constrói prompt COM BIOMETRIA
-        prompt = f"""Analisa a aderência do atleta ao plano de treino.
-
-{biometric_context}
-
-ATIVIDADES RECENTES ({len(recent)}):
+### TAREFA:
+Avalia o readiness do atleta baseado EXCLUSIVAMENTE nos dados biométricos e histórico de atividades.
+Se HRV/RHR indicarem fadiga, PRIORIZA os dados objetivos sobre qualquer sensação subjetiva.
+Prescreve treino apropriado usando a tabela obrigatória.
 """
         
-        for act in recent:
-            prompt += f"\n📅 {act.date}:\n{act.to_brief_summary()}\n"
-        
-        prompt += "\n\nAvalia:"
-        prompt += "\n1. Consistência e progressão de carga"
-        prompt += "\n2. Equilíbrio entre volume e recuperação (baseado em HRV/RHR)"
-        prompt += "\n3. Recomendações para próxima semana"
-        
-        # Chama Gemini
-        response = await call_gemini_with_retry(prompt, user_id)
-        
-        # Salva contexto
-        add_to_context(user_id, 'analyze_plan', prompt, response)
-        
-        await send_long_message(msg, response)
-        
-    except RateLimitExceeded as e:
-        await msg.edit_text(f"⏳ {str(e)}")
-    except CircuitBreakerOpen:
-        await msg.edit_text("⚠️ Serviço temporariamente indisponível.")
-    except GeminiTimeoutError:
-        await msg.edit_text("⏱️ Timeout. Tenta novamente.")
-    except Exception as e:
-        logger.error(f"Erro em /analyze: {e}\n{traceback.format_exc()}")
-        await msg.edit_text("❌ Erro na análise.")
-
-async def analyze_activity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handler /analyze_activity
-    v3.7.0: Agora pergunta sobre carga ANTES de enviar para Gemini
-    """
-    all_activities = get_all_formatted_activities()
-    
-    if not all_activities:
-        await update.message.reply_text("📭 Sem atividades. Faz /sync primeiro.")
-        return
-    
-    # Mostra últimas 5 atividades com botões
-    recent = all_activities[:5]
-    
-    keyboard = []
-    for i, act in enumerate(recent):
-        button_text = f"{act.date} - {act.sport} ({act.duration_min}min)"
-        callback_data = f"analyze_act_{i}"
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        "🔍 Escolhe atividade para analisar:",
-        reply_markup=reply_markup
-    )
-
-async def analyze_activity_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Callback quando user escolhe atividade
-    v3.7.0: Pergunta sobre carga/passageiro ANTES de analisar
-    """
-    query = update.callback_query
-    await query.answer()
-    
-    # Extrai índice
-    activity_index = int(query.data.split('_')[-1])
-    
-    all_activities = get_all_formatted_activities()
-    if activity_index >= len(all_activities):
-        await query.edit_message_text("❌ Atividade não encontrada.")
-        return
-    
-    activity = all_activities[activity_index]
-    
-    # v3.7.0: Verifica se é ciclismo → pergunta sobre carga
-    is_cycling = any(x in activity.sport for x in ['Cicl', 'MTB', 'Spin', 'Bike', 'Estrada'])
-    
-    if is_cycling:
-        # Pergunta sobre passageiro/carga
-        keyboard = [
-            [InlineKeyboardButton("✅ Sim (com carga)", callback_data=f"cargo_yes_{activity_index}")],
-            [InlineKeyboardButton("❌ Não (sozinho)", callback_data=f"cargo_no_{activity_index}")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            f"🚴 {activity.sport} - {activity.date}\n\n"
-            f"Esta volta teve passageiro ou carga extra?",
-            reply_markup=reply_markup
-        )
-    else:
-        # Não é ciclismo, vai direto para análise
-        await perform_activity_analysis(query, activity, user_id=query.from_user.id, has_cargo=False)
-
-async def cargo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Callback quando user responde sobre carga
-    v3.7.0: Nova função crítica - recebe resposta e prossegue para análise
-    """
-    query = update.callback_query
-    await query.answer()
-    
-    # Parse callback data: cargo_(yes|no)_INDEX
-    parts = query.data.split('_')
-    has_cargo = parts[1] == 'yes'
-    activity_index = int(parts[2])
-    
-    all_activities = get_all_formatted_activities()
-    if activity_index >= len(all_activities):
-        await query.edit_message_text("❌ Atividade não encontrada.")
-        return
-    
-    activity = all_activities[activity_index]
-    
-    # Agora sim, vai para análise COM informação de carga
-    await perform_activity_analysis(query, activity, user_id=query.from_user.id, has_cargo=has_cargo)
-
-async def perform_activity_analysis(query, activity: FormattedActivity, user_id: int, has_cargo: bool):
-    """
-    Executa análise da atividade com Gemini
-    v3.7.0: Recebe informação de carga + INJETA BIOMETRIA
-    """
-    proc_msg = await query.edit_message_text("🔍 A analisar atividade...")
-    
-    try:
-        # v3.7.0: Obtém biometria do dia da atividade
-        history = get_recent_biometrics(7)
-        baseline = calculate_biometric_baseline(history)
-        
-        # Encontra biometria do dia específico
-        activity_date = activity.date
-        day_biometrics = next((d for d in history if d.date == activity_date), None)
-        
-        biometric_info = ""
-        if day_biometrics and day_biometrics.is_valid():
-            biometric_info = f"\n📊 BIOMETRIA DO DIA ({activity_date}):\n"
-            if day_biometrics.hrv:
-                biometric_info += f"HRV: {day_biometrics.hrv} ms"
-                if baseline.get('hrv_mean'):
-                    deviation = ((day_biometrics.hrv - baseline['hrv_mean']) / baseline['hrv_mean']) * 100
-                    biometric_info += f" ({deviation:+.1f}%)\n"
-            if day_biometrics.rhr:
-                biometric_info += f"RHR: {day_biometrics.rhr} bpm"
-                if baseline.get('rhr_mean'):
-                    deviation = ((day_biometrics.rhr - baseline['rhr_mean']) / baseline['rhr_mean']) * 100
-                    biometric_info += f" ({deviation:+.1f}%)\n"
-        
-        # Constrói prompt detalhado
-        prompt = f"""Analisa esta atividade em detalhe:
-
-{biometric_info}
-
-📅 DATA: {activity.date}
-🏃 TIPO: {activity.sport}
-⏱️ DURAÇÃO: {activity.duration_min} min
-"""
-        
-        if activity.distance_km:
-            prompt += f"📏 DISTÂNCIA: {activity.distance_km} km\n"
-        
-        # v3.7.0: Altimetria
-        if activity.elevation_gain:
-            prompt += f"⛰️ DESNÍVEL POSITIVO: {activity.elevation_gain} m\n"
-        
-        if activity.avg_hr:
-            prompt += f"💓 FC MÉDIA: {activity.avg_hr} bpm\n"
-        
-        # v3.7.0: Cadência
-        if activity.avg_cadence:
-            prompt += f"👟 CADÊNCIA MÉDIA: {activity.avg_cadence} spm\n"
-        if activity.max_cadence:
-            prompt += f"👟 CADÊNCIA MÁXIMA: {activity.max_cadence} spm\n"
-        
-        if activity.calories:
-            prompt += f"🔥 CALORIAS: {activity.calories} kcal\n"
-        
-        if activity.load:
-            prompt += f"💪 TRAINING LOAD: {activity.load}\n"
-        
-        # v3.7.0: Informação de carga (crítico para ciclismo)
-        if has_cargo:
-            prompt += f"\n⚠️ CONDIÇÃO: Volta com passageiro/carga extra\n"
-        
-        prompt += "\n\nAvalia:"
-        prompt += "\n1. Qualidade da execução (pace, FC, cadência)"
-        prompt += "\n2. Nível de esforço vs. biometria do dia"
-        prompt += "\n3. Pontos fortes e áreas de melhoria"
-        
-        if has_cargo:
-            prompt += "\n4. Impacto da carga extra no desempenho"
-        
-        # Chama Gemini
-        response = await call_gemini_with_retry(prompt, user_id)
-        
-        # Salva contexto
-        add_to_context(user_id, 'activity_analysis', prompt, response, user_input=f"Activity {activity.date}")
+        response_text = await call_gemini_with_retry(prompt, user_id)
         
         # Envia resposta
-        await send_long_message(proc_msg, response)
+        if len(response_text) <= TELEGRAM_SAFE_MESSAGE_LENGTH:
+            await update.message.reply_text(response_text)
+        else:
+            chunks = [response_text[i:i+TELEGRAM_SAFE_MESSAGE_LENGTH] 
+                     for i in range(0, len(response_text), TELEGRAM_SAFE_MESSAGE_LENGTH)]
+            for chunk in chunks:
+                await update.message.reply_text(chunk)
         
-        logger.info(f"Activity analysis completed for user {user_id}")
+        # Salva contexto
+        add_to_context_history(user_id, 'status', prompt, response_text)
         
+    except GeminiTimeoutError:
+        await update.message.reply_text(
+            f"⏱️ Timeout após {GEMINI_TIMEOUT_SECONDS}s.\n"
+            "Tenta novamente."
+        )
     except CircuitBreakerOpen:
-        try:
-            await proc_msg.edit_text(
-                "⚠️ Serviço temporariamente indisponível.\n"
-                "Por favor, tenta novamente em 1 minuto."
+        await update.message.reply_text(
+            "⚠️ Serviço temporariamente indisponível.\n"
+            "Aguarda 1 minuto."
+        )
+    except RateLimitExceeded:
+        await update.message.reply_text(
+            "⚠️ Rate limit excedido.\n"
+            "Aguarda 1 minuto."
+        )
+    except Exception as e:
+        logger.error(f"Erro em /status: {e}\n{traceback.format_exc()}")
+        await update.message.reply_text(f"❌ Erro: {str(e)[:100]}")
+
+async def activities_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler /activities - Lista atividades recentes"""
+    try:
+        all_activities = get_all_formatted_activities()
+        
+        if not all_activities:
+            await update.message.reply_text(
+                "📭 Sem atividades.\n\n"
+                "Usa /sync ou /import."
             )
-        except:
-            pass
-            
-    except GeminiTimeoutError:
-        try:
-            await proc_msg.edit_text("⏱️ Timeout ao analisar atividade.")
-        except:
-            pass
-            
-    except Exception as e:
-        logger.error(f"Activity analysis error: {e}")
-        try:
-            await proc_msg.edit_text("❌ Erro na análise da atividade.")
-        except:
-            pass
-
-async def bike_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback para confirmação de bike"""
-    query = update.callback_query
-    await query.answer()
-    
-    # Implementação placeholder
-    await query.edit_message_text("✅ Confirmado.")
-
-async def cycling_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback para tipo de ciclismo"""
-    query = update.callback_query
-    await query.answer()
-    
-    # Implementação placeholder
-    await query.edit_message_text("✅ Tipo registado.")
-
-async def sync_confirmed_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback para confirmação de sync"""
-    query = update.callback_query
-    await query.answer()
-    
-    await query.edit_message_text("🔄 A criar pedido de sync...")
-    
-    if create_sync_request():
-        await query.message.reply_text("✅ Pedido criado. Aguarda 1min.")
-    else:
-        await query.message.reply_text("❌ Erro ao criar pedido.")
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handler para mensagens de texto livre (perguntas conversacionais)
-    v3.7.0: INJETA BIOMETRIA no contexto conversacional
-    """
-    user_id = update.effective_user.id
-    user_message = update.message.text.strip()
-    
-    if not user_message:
-        return
-    
-    msg = await update.message.reply_text("🤔 A pensar...")
-    
-    try:
-        # v3.7.0: Adiciona biometria ao contexto conversacional
-        history = get_recent_biometrics(7)
-        baseline = calculate_biometric_baseline(history)
-        biometric_context = format_biometric_context(history, baseline)
+            return
         
-        # Constrói prompt conversacional COM biometria
-        conversational_prompt = build_conversational_prompt(user_id, user_message)
+        recent = all_activities[:MAX_ACTIVITIES_DISPLAY]
         
-        # Injeta biometria no início do prompt
-        full_prompt = f"{biometric_context}\n\n{conversational_prompt}"
+        msg = f"🏃 ATIVIDADES ({len(all_activities)} total, {len(recent)} recentes):\n\n"
         
-        # Chama Gemini
-        response = await call_gemini_with_retry(full_prompt, user_id)
+        for i, act in enumerate(recent, 1):
+            msg += f"{i}. {act.to_brief_summary()}\n"
         
-        # NÃO salva contexto aqui (apenas perguntas ad-hoc)
+        if len(all_activities) > MAX_ACTIVITIES_DISPLAY:
+            msg += f"\n... e mais {len(all_activities) - MAX_ACTIVITIES_DISPLAY}"
         
-        await send_long_message(msg, response)
-        
-    except RateLimitExceeded as e:
-        await msg.edit_text(f"⏳ {str(e)}")
-    except CircuitBreakerOpen:
-        await msg.edit_text("⚠️ Serviço temporariamente indisponível.")
-    except GeminiTimeoutError:
-        await msg.edit_text("⏱️ Timeout. Tenta novamente.")
-    except Exception as e:
-        logger.error(f"Erro em handle_message: {e}\n{traceback.format_exc()}")
-        await msg.edit_text("❌ Erro ao processar pergunta.")
-
-async def import_historical(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Importa dados"""
-    await update.message.reply_text("📥 A criar pedido...")
-    
-    if create_import_request(7):
-        await update.message.reply_text("✅ Pedido criado. Aguarda 2-5min.")
-    else:
-        await update.message.reply_text("❌ Erro.")
-
-async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sync"""
-    await update.message.reply_text("🔄 A criar pedido...")
-    
-    if create_sync_request():
-        await update.message.reply_text("✅ Pedido criado. Aguarda 1min.")
-    else:
-        await update.message.reply_text("❌ Erro.")
-
-async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cleanup"""
-    await update.message.reply_text("🧹 A limpar...")
-    
-    try:
-        cleaned, messages = cleanup_old_flags()
-        duplicates, total, act_messages = reorganize_activities()
-        
-        msg = "🧹 LIMPEZA:\n\n"
-        msg += "FLAGS:\n" + "\n".join(messages[:5])
-        msg += f"\n\nATIVIDADES:\n" + "\n".join(act_messages[:5])
+        msg += "\n\n💡 /analyze_activity para análise individual"
         
         await update.message.reply_text(msg)
         
     except Exception as e:
-        logger.error(f"cleanup error: {e}")
-        await update.message.reply_text("❌ Erro.")
+        logger.error(f"Erro em /activities: {e}")
+        await update.message.reply_text(f"❌ Erro: {str(e)[:100]}")
+
+async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler /analyze - Análise de aderência ao plano"""
+    user_id = update.effective_user.id
+    
+    try:
+        await update.message.reply_text("🔍 Analisando aderência...")
+        
+        # v3.8.0: BIOMETRIA OBRIGATÓRIA
+        history = get_recent_biometrics(7)
+        baseline = calculate_biometric_baseline(history)
+        bio_context = format_biometric_context(history, baseline)
+        
+        activities = get_all_formatted_activities()
+        recent = activities[:MAX_ACTIVITIES_IN_ANALYSIS]
+        
+        if not recent:
+            await update.message.reply_text("📭 Sem atividades para análise.")
+            return
+        
+        prompt = f"""
+{bio_context}
+
+### ATIVIDADES (Últimas {len(recent)}):
+
+"""
+        
+        for act in recent:
+            prompt += act.to_detailed_text() + "\n\n"
+        
+        prompt += """
+### TAREFA:
+Analisa aderência ao plano de treino.
+Identifica padrões, gaps e ajustes necessários.
+PRIORIZA dados biométricos sobre sensação subjetiva.
+"""
+        
+        response_text = await call_gemini_with_retry(prompt, user_id)
+        
+        # Envia resposta
+        if len(response_text) <= TELEGRAM_SAFE_MESSAGE_LENGTH:
+            await update.message.reply_text(response_text)
+        else:
+            chunks = [response_text[i:i+TELEGRAM_SAFE_MESSAGE_LENGTH] 
+                     for i in range(0, len(response_text), TELEGRAM_SAFE_MESSAGE_LENGTH)]
+            for chunk in chunks:
+                await update.message.reply_text(chunk)
+        
+        # Salva contexto
+        add_to_context_history(user_id, 'analyze', prompt, response_text)
+        
+    except GeminiTimeoutError:
+        await update.message.reply_text(
+            f"⏱️ Timeout após {GEMINI_TIMEOUT_SECONDS}s.\n"
+            "Tenta novamente."
+        )
+    except Exception as e:
+        logger.error(f"Erro em /analyze: {e}\n{traceback.format_exc()}")
+        await update.message.reply_text(f"❌ Erro: {str(e)[:100]}")
+
+async def analyze_activity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handler /analyze_activity - Mostra botões para escolher atividade
+    v3.8.0: CORRIGIDO - Primeiro pergunta sobre carga, depois envia para Gemini
+    """
+    try:
+        activities = get_all_formatted_activities()
+        
+        if not activities:
+            await update.message.reply_text("📭 Sem atividades.")
+            return
+        
+        recent = activities[:5]
+        
+        keyboard = []
+        for act in recent:
+            button_text = act.to_brief_summary()
+            callback_data = f"analyze_act_{act.raw.get('id', 'unknown')}"
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "🏃 Escolhe atividade:",
+            reply_markup=reply_markup
+        )
+        
+    except Exception as e:
+        logger.error(f"Erro em /analyze_activity: {e}")
+        await update.message.reply_text(f"❌ Erro: {str(e)[:100]}")
+
+async def analyze_activity_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Callback quando user escolhe atividade
+    v3.8.0: FLUXO CORRETO - Pergunta sobre carga ANTES de enviar para Gemini
+    """
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        activity_id = query.data.split('_')[-1]
+        
+        activities = get_all_formatted_activities()
+        activity = next((a for a in activities if a.raw.get('id') == activity_id), None)
+        
+        if not activity:
+            await query.message.reply_text("❌ Atividade não encontrada.")
+            return
+        
+        # v3.8.0: Se for ciclismo, pergunta sobre carga PRIMEIRO
+        is_cycling = any(x in activity.sport for x in ['Cicl', 'MTB', 'Spin', 'Bike'])
+        
+        if is_cycling:
+            # Mostra botões de Carga/Passageiro
+            keyboard = [
+                [
+                    InlineKeyboardButton("🚴 Carga", callback_data=f"cargo_yes_{activity_id}"),
+                    InlineKeyboardButton("🚴‍♂️ Passageiro", callback_data=f"cargo_no_{activity_id}")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.message.reply_text(
+                f"🚴 {activity.sport}\n\n"
+                "Levaste carga ou foste passageiro?",
+                reply_markup=reply_markup
+            )
+        else:
+            # Não é ciclismo, analisa diretamente
+            await perform_activity_analysis(query.message, activity, user_id=query.from_user.id)
+            
+    except Exception as e:
+        logger.error(f"Erro em analyze_activity_callback: {e}")
+        await query.message.reply_text(f"❌ Erro: {str(e)[:100]}")
+
+async def cargo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    v3.8.0: Callback para resposta de carga/passageiro
+    SÓ AGORA envia para o Gemini
+    """
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        # Parse: cargo_(yes|no)_ACTIVITY_ID
+        parts = query.data.split('_')
+        has_cargo = parts[1] == 'yes'
+        activity_id = parts[2]
+        
+        activities = get_all_formatted_activities()
+        activity = next((a for a in activities if a.raw.get('id') == activity_id), None)
+        
+        if not activity:
+            await query.message.reply_text("❌ Atividade não encontrada.")
+            return
+        
+        # Adiciona info de carga ao contexto
+        cargo_text = "CARGA" if has_cargo else "PASSAGEIRO"
+        
+        # AGORA sim, envia para análise
+        await perform_activity_analysis(
+            query.message, 
+            activity, 
+            user_id=query.from_user.id,
+            extra_context=f"\n⚠️ IMPORTANTE: Esta saída de ciclismo foi como {cargo_text}.\n"
+        )
+        
+    except Exception as e:
+        logger.error(f"Erro em cargo_callback: {e}")
+        await query.message.reply_text(f"❌ Erro: {str(e)[:100]}")
+
+async def perform_activity_analysis(message, activity: FormattedActivity, user_id: int, extra_context: str = ""):
+    """
+    v3.8.0: Função auxiliar que faz a análise real
+    BIOMETRIA OBRIGATÓRIA
+    """
+    try:
+        await message.reply_text("🔍 Analisando...")
+        
+        # v3.8.0: BIOMETRIA OBRIGATÓRIA
+        history = get_recent_biometrics(7)
+        baseline = calculate_biometric_baseline(history)
+        bio_context = format_biometric_context(history, baseline)
+        
+        prompt = f"""
+{bio_context}
+
+{extra_context}
+
+### ATIVIDADE:
+
+{activity.to_detailed_text()}
+
+### TAREFA:
+Análise DETALHADA desta atividade.
+Avalia intensidade, volume, técnica e recuperação necessária.
+PRIORIZA dados biométricos.
+"""
+        
+        response_text = await call_gemini_with_retry(prompt, user_id)
+        
+        # Envia resposta
+        if len(response_text) <= TELEGRAM_SAFE_MESSAGE_LENGTH:
+            await message.reply_text(response_text)
+        else:
+            chunks = [response_text[i:i+TELEGRAM_SAFE_MESSAGE_LENGTH] 
+                     for i in range(0, len(response_text), TELEGRAM_SAFE_MESSAGE_LENGTH)]
+            for chunk in chunks:
+                await message.reply_text(chunk)
+        
+        # Salva contexto
+        add_to_context_history(user_id, 'analyze_activity', prompt, response_text)
+        
+    except GeminiTimeoutError:
+        await message.reply_text(
+            f"⏱️ Timeout após {GEMINI_TIMEOUT_SECONDS}s.\n"
+            "Tenta novamente."
+        )
+    except Exception as e:
+        logger.error(f"Erro em perform_activity_analysis: {e}\n{traceback.format_exc()}")
+        await message.reply_text(f"❌ Erro: {str(e)[:100]}")
+
+async def bike_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback para tipo de ciclismo (mantido para compatibilidade)"""
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text("⚠️ Use /analyze_activity para análise.")
+
+async def cycling_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback para tipo de ciclismo (mantido para compatibilidade)"""
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text("⚠️ Use /analyze_activity para análise.")
+
+async def import_historical(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler /import - Importa histórico"""
+    try:
+        if create_import_request():
+            await update.message.reply_text(
+                "✅ Pedido de importação criado.\n\n"
+                "O sistema vai importar atividades na próxima sincronização.\n"
+                "Aguarda alguns minutos."
+            )
+        else:
+            await update.message.reply_text("❌ Erro ao criar pedido.")
+    except Exception as e:
+        logger.error(f"Erro em /import: {e}")
+        await update.message.reply_text(f"❌ Erro: {str(e)[:100]}")
+
+async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler /sync - Sincroniza dados"""
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Confirmar", callback_data="sync_confirmed"),
+            InlineKeyboardButton("❌ Cancelar", callback_data="sync_cancel")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "🔄 Sincronizar dados do Garmin?\n\n"
+        "Isto vai:\n"
+        "• Reorganizar atividades\n"
+        "• Remover duplicados\n"
+        "• Atualizar biometria",
+        reply_markup=reply_markup
+    )
+
+async def sync_confirmed_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback de confirmação de sync"""
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        await query.message.reply_text("🔄 Sincronizando...")
+        
+        # Cria pedido de sync
+        if not create_sync_request():
+            await query.message.reply_text("❌ Erro ao criar pedido de sync.")
+            return
+        
+        # Reorganiza atividades
+        duplicates, total, messages = reorganize_activities()
+        
+        msg = "✅ Sincronização completa:\n\n"
+        msg += "\n".join(messages)
+        
+        await query.message.reply_text(msg)
+        
+    except Exception as e:
+        logger.error(f"Erro em sync: {e}")
+        await query.message.reply_text(f"❌ Erro: {str(e)[:100]}")
+
+async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler /cleanup - Limpeza de dados"""
+    try:
+        await update.message.reply_text("🧹 Limpando...")
+        
+        cleaned, messages = cleanup_old_flags()
+        
+        msg = f"🧹 LIMPEZA:\n\n"
+        msg += "\n".join(messages)
+        msg += f"\n\nTotal: {cleaned} flags removidos"
+        
+        await update.message.reply_text(msg)
+        
+    except Exception as e:
+        logger.error(f"Erro em /cleanup: {e}")
+        await update.message.reply_text(f"❌ Erro: {str(e)[:100]}")
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lista análises anteriores"""
+    """Handler /history - Lista análises anteriores"""
     user_id = update.effective_user.id
     context_data = load_context_from_disk(user_id)
     
@@ -1661,7 +1691,7 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 async def clear_context_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Limpa contexto"""
+    """Handler /clear_context - Limpa contexto"""
     user_id = update.effective_user.id
     
     if clear_context_disk(user_id):
@@ -1670,7 +1700,7 @@ async def clear_context_command(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("ℹ️ Sem contexto.")
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Estatísticas"""
+    """Handler /stats - Estatísticas"""
     stats = get_context_stats()
     
     if 'error' in stats:
@@ -1685,7 +1715,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for analysis_type, count in stats['by_type'].items():
             msg += f"  • {analysis_type}: {count}\n"
     
-    # v3.6: Adicionar stats de circuit breaker e cache
+    # Circuit breaker e cache
     msg += f"\n🔌 Circuit Breaker:\n"
     msg += f"  Estado: {circuit_breaker.state}\n"
     msg += f"  Falhas: {circuit_breaker.failure_count}/{CIRCUIT_BREAKER_THRESHOLD}\n"
@@ -1693,33 +1723,106 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg += f"\n💾 Cache:\n"
     msg += f"  Entradas: {len(response_cache.cache)}/{RESPONSE_CACHE_SIZE}\n"
     
+    # v3.8.0: Health info
+    avg_latency = health_state.get_avg_gemini_latency()
+    if avg_latency:
+        msg += f"\n⚡ Gemini:\n"
+        msg += f"  Latência média: {avg_latency}s\n"
+    
     await update.message.reply_text(msg)
 
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Debug"""
-    data = load_garmin_data()
-    all_activities = get_all_formatted_activities()
-    
-    msg = f"""🔧 DEBUG v{BOT_VERSION}:
+    """
+    Handler /debug - Informações de debug
+    v3.8.0: RESILIENTE - Usa nova lógica de leitura
+    """
+    try:
+        data = load_garmin_data()
+        
+        # v3.8.0: Usa função resiliente
+        all_activities = get_all_formatted_activities()
+        
+        msg = f"""🔧 DEBUG v{BOT_VERSION}:
 
 📊 Dados Garmin: {'Sim' if data else 'Não'}
 🏃 Atividades: {len(all_activities)}
 """
-    
-    if data:
-        history = parse_garmin_history(data)
-        valid = [h for h in history if h.is_valid()]
-        msg += f"✅ Dias válidos: {len(valid)}"
-    
-    # v3.6: Info adicional
-    msg += f"\n\n🔌 Circuit Breaker: {circuit_breaker.state}"
-    msg += f"\n💾 Cache: {len(response_cache.cache)} entradas"
-    msg += f"\n⏱️ Rate limiter: {len(rate_limiter.requests)} users tracked"
-    
-    await update.message.reply_text(msg)
+        
+        if data:
+            history = parse_garmin_history(data)
+            valid = [h for h in history if h.is_valid()]
+            msg += f"✅ Dias válidos: {len(valid)}"
+        
+        msg += f"\n\n🔌 Circuit Breaker: {circuit_breaker.state}"
+        msg += f"\n💾 Cache: {len(response_cache.cache)} entradas"
+        msg += f"\n⏱️ Rate limiter: {len(rate_limiter.requests)} users tracked"
+        
+        # v3.8.0: Integridade do ficheiro
+        is_valid, status = check_activities_integrity()
+        status_icon = "✅" if is_valid else "⚠️"
+        msg += f"\n\n{status_icon} activities.json: {status}"
+        
+        await update.message.reply_text(msg)
+        
+    except Exception as e:
+        logger.error(f"Erro em /debug: {e}\n{traceback.format_exc()}")
+        await update.message.reply_text(f"❌ Erro: {str(e)[:100]}")
+
+async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    v3.8.0: Handler /health - Health check endpoint
+    Verifica:
+    - Espaço em disco
+    - Integridade do activities.json
+    - Latência do Gemini
+    """
+    try:
+        await update.message.reply_text("🏥 A verificar saúde do sistema...")
+        
+        # Espaço em disco
+        has_space, free_mb = check_disk_space()
+        disk_status = "✅" if has_space else "🔴"
+        disk_text = f"{disk_status} Espaço: {free_mb:.1f}MB livre"
+        
+        # Integridade do ficheiro
+        is_valid, integrity_msg = check_activities_integrity()
+        integrity_status = "✅" if is_valid else "⚠️"
+        integrity_text = f"{integrity_status} activities.json: {integrity_msg}"
+        
+        # Latência Gemini
+        avg_latency = health_state.get_avg_gemini_latency()
+        if avg_latency:
+            latency_status = "✅" if avg_latency < 30 else "⚠️" if avg_latency < 45 else "🔴"
+            latency_text = f"{latency_status} Gemini: {avg_latency}s (avg últimas {len(health_state.gemini_latencies)} calls)"
+        else:
+            latency_text = "ℹ️ Gemini: Sem dados de latência"
+        
+        # Circuit breaker
+        cb_status = "✅" if circuit_breaker.state == 'closed' else "⚠️" if circuit_breaker.state == 'half-open' else "🔴"
+        cb_text = f"{cb_status} Circuit Breaker: {circuit_breaker.state}"
+        
+        msg = f"""🏥 HEALTH CHECK v{BOT_VERSION}:
+
+{disk_text}
+{integrity_text}
+{latency_text}
+{cb_text}
+
+💾 Cache: {len(response_cache.cache)}/{RESPONSE_CACHE_SIZE}
+⏱️ Timeout: {GEMINI_TIMEOUT_SECONDS}s
+"""
+        
+        await update.message.reply_text(msg)
+        
+    except Exception as e:
+        logger.error(f"Erro em /health: {e}\n{traceback.format_exc()}")
+        await update.message.reply_text(f"❌ Erro: {str(e)[:100]}")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Help"""
+    """
+    Handler /help - Ajuda completa
+    v3.8.0: CORRIGIDO - Inclui todos os comandos
+    """
     await update.message.reply_text(
         f"🏋️ FitnessJournal v{BOT_VERSION}\n\n"
         "Comandos principais:\n"
@@ -1727,18 +1830,95 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/analyze - Aderência ao plano\n"
         "/analyze_activity - Análise individual\n"
         "/activities - Lista atividades\n"
+        "/sync - Sincroniza dados\n"
+        "/import - Importa histórico\n"
+        "/cleanup - Limpeza de dados\n"
         "/history - Análises anteriores\n"
-        "/help - Ajuda\n\n"
-        "🆕 v3.7.0:\n"
-        "• Contexto biométrico completo (HRV/RHR)\n"
-        "• Altimetria (D+) em ciclismo/corrida\n"
-        "• Cadência em corrida (spm)\n"
-        "• Pergunta sobre carga no ciclismo\n"
-        "• Timeout aumentado (45s)\n"
-        "• Retry inteligente com backoff"
+        "/clear_context - Limpa contexto\n"
+        "/stats - Estatísticas\n"
+        "/debug - Informações de debug\n"
+        "/health - Health check do sistema\n"
+        "/help - Esta ajuda\n\n"
+        "🆕 v3.8.0:\n"
+        "• Blindagem de dados (corrupção list→dict)\n"
+        "• Health check endpoint (/health)\n"
+        "• Cadência de ciclismo (rpm)\n"
+        "• Comandos /sync, /import, /debug recuperados\n"
+        "• Timeout aumentado (60s)\n"
+        "• Biometria obrigatória em todas análises\n"
+        "• Atomic write para activities.json"
     )
 
-# v3.7.0: HANDLER PARA COMANDO NÃO RECONHECIDO
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler para mensagens de texto livre (follow-up questions)"""
+    user_id = update.effective_user.id
+    message_text = update.message.text
+    
+    try:
+        # Verifica se há contexto ativo
+        context_data = load_context_from_disk(user_id)
+        
+        if not context_data or not context_data.get('history'):
+            await update.message.reply_text(
+                "💡 Usa /status, /analyze ou /analyze_activity primeiro.\n"
+                "Depois podes fazer perguntas sobre a análise."
+            )
+            return
+        
+        # Limita tamanho
+        if len(message_text) > MAX_FEELING_LENGTH:
+            await update.message.reply_text(
+                f"❌ Mensagem demasiado longa.\n"
+                f"Máximo: {MAX_FEELING_LENGTH} caracteres."
+            )
+            return
+        
+        await update.message.reply_text("🤔 A processar pergunta...")
+        
+        # Obtém contexto
+        context_text = get_context_for_followup(user_id)
+        
+        # v3.8.0: BIOMETRIA OBRIGATÓRIA
+        history = get_recent_biometrics(7)
+        baseline = calculate_biometric_baseline(history)
+        bio_context = format_biometric_context(history, baseline)
+        
+        prompt = f"""
+{bio_context}
+
+{context_text}
+
+### PERGUNTA DO ATLETA:
+{message_text}
+
+### TAREFA:
+Responde à pergunta baseado no contexto das análises anteriores e dados biométricos.
+PRIORIZA dados objetivos (HRV/RHR).
+"""
+        
+        response_text = await call_gemini_with_retry(prompt, user_id)
+        
+        # Envia resposta
+        if len(response_text) <= TELEGRAM_SAFE_MESSAGE_LENGTH:
+            await update.message.reply_text(response_text)
+        else:
+            chunks = [response_text[i:i+TELEGRAM_SAFE_MESSAGE_LENGTH] 
+                     for i in range(0, len(response_text), TELEGRAM_SAFE_MESSAGE_LENGTH)]
+            for chunk in chunks:
+                await update.message.reply_text(chunk)
+        
+        # Salva no contexto
+        add_to_context_history(user_id, 'followup', prompt, response_text)
+        
+    except GeminiTimeoutError:
+        await update.message.reply_text(
+            f"⏱️ Timeout após {GEMINI_TIMEOUT_SECONDS}s.\n"
+            "Tenta novamente."
+        )
+    except Exception as e:
+        logger.error(f"Erro em handle_message: {e}\n{traceback.format_exc()}")
+        await update.message.reply_text(f"❌ Erro: {str(e)[:100]}")
+
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler para comandos não reconhecidos"""
     command = update.message.text
@@ -1758,14 +1938,15 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/clear_context - Limpa contexto\n"
         "/stats - Estatísticas\n"
         "/debug - Informações de debug\n"
+        "/health - Health check do sistema\n"
         "/help - Ajuda completa"
     )
 
 # ==========================================
-# MAIN (v3.7.0)
+# MAIN (v3.8.0)
 # ==========================================
 def main():
-    """Entry point v3.7.0"""
+    """Entry point v3.8.0"""
     logger.info("=" * 50)
     logger.info(f"FitnessJournal Bot v{BOT_VERSION}")
     logger.info(f"{BOT_VERSION_DESC}")
@@ -1779,7 +1960,15 @@ def main():
         logger.error("GEMINI_API_KEY não configurado")
         return
     
-    # v3.7.0: Enriquecimento automático de atividades
+    # v3.8.0: Verificação de integridade no boot
+    is_valid, integrity_msg = check_activities_integrity()
+    if not is_valid:
+        logger.warning(f"⚠️ INTEGRIDADE: {integrity_msg}")
+        logger.info("🔧 Será corrigido automaticamente no próximo load...")
+    else:
+        logger.info(f"✅ INTEGRIDADE: {integrity_msg}")
+    
+    # Enriquecimento automático
     logger.info("🔍 Verificando atividades para enriquecimento...")
     check_and_enrich_activities()
     
@@ -1793,7 +1982,7 @@ def main():
     
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Command Handlers
+    # Command Handlers (v3.8.0: TODOS ATIVOS)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("activities", activities_command))
@@ -1806,31 +1995,35 @@ def main():
     app.add_handler(CommandHandler("clear_context", clear_context_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("debug", debug_command))
+    app.add_handler(CommandHandler("health", health_command))  # v3.8.0: NOVO
     app.add_handler(CommandHandler("help", help_command))
     
     # Callback Query Handlers
     app.add_handler(CallbackQueryHandler(sync_confirmed_callback, pattern=r'^sync_confirmed$'))
     app.add_handler(CallbackQueryHandler(bike_callback, pattern=r'^bike_(yes|no)$'))
     app.add_handler(CallbackQueryHandler(analyze_activity_callback, pattern=r'^analyze_act_\d+$'))
-    app.add_handler(CallbackQueryHandler(cargo_callback, pattern=r'^cargo_(yes|no)_\d+$'))  # v3.7.0: CRÍTICO
+    app.add_handler(CallbackQueryHandler(cargo_callback, pattern=r'^cargo_(yes|no)_\d+$'))
     app.add_handler(CallbackQueryHandler(cycling_type_callback, pattern=r'^cyctype_\w+_\d+$'))
     
     # Message Handler (texto livre)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # v3.7.0: Handler para comandos não reconhecidos (DEVE VIR POR ÚLTIMO)
+    # Handler para comandos não reconhecidos (DEVE VIR POR ÚLTIMO)
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     
-    logger.info("✅ Bot v3.7.0 iniciado com:")
+    logger.info("✅ Bot v3.8.0 iniciado com:")
     logger.info(f"  - Timeout Gemini: {GEMINI_TIMEOUT_SECONDS}s (aumentado)")
-    logger.info(f"  - Retry delays: {RETRY_DELAYS} (inteligente)")
+    logger.info(f"  - Retry delays: {RETRY_DELAYS}")
     logger.info(f"  - Circuit breaker: {CIRCUIT_BREAKER_THRESHOLD} falhas threshold")
     logger.info(f"  - Cache: {RESPONSE_CACHE_SIZE} entradas, TTL {CACHE_TTL_SECONDS}s")
     logger.info(f"  - Rate limit: {RATE_LIMIT_MAX_REQUESTS} req/{RATE_LIMIT_WINDOW}s")
-    logger.info(f"  - Biometric context: ENABLED")
+    logger.info(f"  - Biometric context: OBRIGATÓRIO")
+    logger.info(f"  - Data resilience: ENABLED (list→dict auto-fix)")
+    logger.info(f"  - Atomic write: ENABLED")
+    logger.info(f"  - Health check: /health ENABLED")
+    logger.info(f"  - Bike cadence: ENABLED (rpm)")
     logger.info(f"  - Altitude extraction: ENABLED")
-    logger.info(f"  - Cadence extraction: ENABLED")
-    logger.info(f"  - Cargo question: ENABLED")
+    logger.info(f"  - Run cadence: ENABLED (spm)")
     
     print(f"🤖 Bot v{BOT_VERSION} ativo")
     
