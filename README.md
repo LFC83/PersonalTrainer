@@ -125,6 +125,25 @@ EN: How do I clear pending requests?
 
 # Changelog
 
+## [3.7.0] - 2026-03-01
+
+## 🎯 Resumo da Versão
+
+**Versão:** 3.7.0  
+**Data:** 2026-03-01  
+**Tipo:** Feature Release + Performance Enhancement  
+
+### O Que Mudou (TL;DR)
+1. ✅ Bot agora extrai **altimetria** (D+) em ciclismo e corrida
+2. ✅ Bot agora extrai **cadência** (steps/min) em corrida
+3. ✅ Bot **SEMPRE** injeta **HRV/RHR** nos prompts do Gemini
+4. ✅ Bot **pergunta sobre carga** antes de analisar atividades de ciclismo
+5. ✅ **Timeout aumentado** para 45s (era 30s)
+6. ✅ **Retry inteligente** (dobra delay após timeout)
+7. ✅ **System prompt atualizado** (prioridade aos dados biométricos)
+8. ✅ **Handler para comandos não reconhecidos**
+
+
 ## [3.6.0] - 2026-03-01
 
 ### 🎯 Resumo da Versão
