@@ -125,6 +125,20 @@ EN: How do I clear pending requests?
 
 # Changelog
 
+## 🚀 Versão Atual: 3.10.0 (2026-03-02)
+
+Esta versão foca-se na **estabilidade estrutural** e na correção de erros críticos de parsing de dados do Garmin Connect, além de melhorar o feedback visual do utilizador.
+
+### 🔧 Correções Críticas e Estabilidade
+- **Data Resilience (List vs Dict):** Resolvido o erro `AttributeError: 'list' object has no attribute 'get'` no ficheiro consolidado. O bot agora deteta e processa automaticamente tanto dicionários como listas de biometria.
+- **Seletor de Ciclismo:** Implementada a distinção entre **MTB, Estrada, Spinning e Cidade**. O bot agora pergunta o tipo de ciclismo antes de iniciar a análise para garantir recomendações precisas.
+- **Sync Feedback:** Corrigido o sistema de monitorização de ficheiros `.flag`. O bot agora notifica o utilizador assim que o processamento em background termina.
+
+### ✨ Novas Funcionalidades e UX
+- **Evolução HRV:** O comando `/status` agora apresenta a tendência visual dos últimos 5 dias (ex: `📈 HRV: 65 -> 68 -> 62...`).
+- **Deep Logging:** Melhoria nos logs de sistema para identificar o tipo de dados carregados em cada ficheiro JSON, facilitando o debug.
+- **Atomic Writes:** Garantia de integridade dos ficheiros ao gravar dados, evitando corrupção em caso de interrupção.
+
 ## 🚀 Versão Atual: 3.9.0 (2025-03-02)
 
 Esta versão foca-se na correção crítica da extração de dados do Garmin Connect e na melhoria da experiência do utilizador (UX).
