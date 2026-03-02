@@ -125,6 +125,21 @@ EN: How do I clear pending requests?
 
 # Changelog
 
+## 🚀 Versão: 3.11.0 (2026-03-02)
+
+Esta versão focou-se na **restauração da experiência de utilizador (UX)** e no refinamento do motor de análise do Gemini, trazendo de volta o detalhe técnico que caracteriza o bot.
+
+### 🎨 Melhorias de UX & Design de Dados
+- **Visible Biometrics:** O comando `/status` agora apresenta os dados de HRV, RHR e Sono **antes** de solicitar o feedback subjetivo ("Feeling"), permitindo uma avaliação mais consciente.
+- **Technical Headers:** Reintrodução do cabeçalho detalhado em cada análise de atividade, incluindo Emojis dinâmicos para Duração, Distância, FC, Altimetria e Cadência.
+- **Tendência Visual:** Implementação de histórico de HRV dos últimos 5 dias diretamente no chat (ex: `65 -> 68 -> 62...`).
+
+### 🧠 Inteligência Artificial & Precisão
+- **Equipment Lockdown:** Restrição severa no System Prompt para que o Gemini sugira apenas exercícios baseados na lista real de `EQUIPAMENTOS_GIM`.
+- **Análise Contextual:** O bot agora mapeia cadência (RPM/SPM) e altimetria (D+) para que o Gemini forneça feedback sobre eficiência mecânica e esforço em subida.
+- **Tone Refinement:** Ajuste da personalidade da IA para um tom de "Personal Trainer de Elite", focado em dados e prontidão biológica.
+
+
 ## 🚀 Versão Atual: 3.10.0 (2026-03-02)
 
 Esta versão foca-se na **estabilidade estrutural** e na correção de erros críticos de parsing de dados do Garmin Connect, além de melhorar o feedback visual do utilizador.
