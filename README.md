@@ -125,6 +125,16 @@ EN: How do I clear pending requests?
 
 # Changelog
 
+## 🏆 Versão Atual: 3.12.0 (2026-03-02) - "The Architect Update"
+
+Esta versão marca a maturidade do sistema de decisão, separando tecnicamente o que é **Análise de Performance** do que é **Planeamento de Treino**.
+
+### 🛠️ Destaques Técnicos
+- **Strict Context Separation:** O Gemini agora atua como dois agentes distintos: um Analista de Dados (para atividades) e um Treinador de Performance (para o status diário).
+- **Interactive Cycling Flow:** Introdução de perguntas dinâmicas sobre o tipo de ciclismo e carga (passageiro/150kg total), permitindo análises de esforço ultra-precisas.
+- **Biometric Dashboard:** O comando `/status` foi invertido para mostrar primeiro os dados reais (HRV, RHR, Sono) e a tendência de 5 dias, antes de pedir o feedback do utilizador.
+- **Data Resilience:** Implementado fallback biométrico automático para o dia anterior caso os dados de hoje ainda não tenham sido sincronizados.
+
 ## 🚀 Versão: 3.11.0 (2026-03-02)
 
 Esta versão focou-se na **restauração da experiência de utilizador (UX)** e no refinamento do motor de análise do Gemini, trazendo de volta o detalhe técnico que caracteriza o bot.
