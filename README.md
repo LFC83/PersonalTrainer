@@ -125,6 +125,23 @@ EN: How do I clear pending requests?
 
 # Changelog
 
+## 🚀 Versão Atual: 3.9.0 (2025-03-02)
+
+Esta versão foca-se na correção crítica da extração de dados do Garmin Connect e na melhoria da experiência do utilizador (UX).
+
+### 🔧 Correções Críticas e Melhorias
+- **Novo Garmin Parser:** Resolvido o erro que mostrava atividades como "Unknown". Agora o bot acede corretamente a campos aninhados (`activityName`, `typeKey`, etc).
+- **Cálculo de Duração:** Corrigida a conversão de segundos para minutos no ecrã de atividades.
+- **Deep Nested Biometrics:** O bot agora "escava" os ficheiros JSON para encontrar o HRV (`lastNightAvg`), RHR e Pontuação de Sono em sub-estruturas complexas.
+- **Fluxo de "Feeling":** Antes de cada análise de prontidão (`/status`), o bot pergunta ativamente como o utilizador se sente (0-10).
+- **Feedback de Sincronização:** Adicionado sistema de monitorização de ficheiros `.flag` para notificar o utilizador assim que o `fetcher` termina o seu trabalho.
+- **Telemetria Avançada:** Suporte total para Cadência de Ciclismo (RPM), Cadência de Corrida (SPM) e Altimetria (D+).
+
+### 🛠️ Comandos Atualizados
+- `/status`: Agora inclui a fase de recolha de feedback subjetivo.
+- `/health`: Reporta a integridade da base de dados e sucesso na leitura de biometria.
+- `/activities`: Lista detalhada com data, tipo, duração, batimento médio, altimetria e cadência.
+
 ### CHANGELOG v3.8.0
 
 🎯 Objetivo da Versão
