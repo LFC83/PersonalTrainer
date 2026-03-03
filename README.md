@@ -125,6 +125,19 @@ EN: How do I clear pending requests?
 
 # Changelog
 
+
+## 🚀 Versão Atual: 3.15.0 (2026-03-03) - "Cycling Logic Restoration"
+
+Esta versão restaura funcionalidades críticas de análise de ciclismo e refina a precisão do motor de IA para diferentes modalidades de bicicleta.
+
+### 🚲 Melhorias no Ciclismo
+- **Seletor Global de Modalidade:** Correção de uma regressão que impedia utilizadores de Road Biking ou Mountain Biking explícitos de escolherem o tipo de terreno. Agora, o seletor (MTB, Estrada, Spinning, Cidade) é apresentado para todas as variantes de ciclismo.
+- **Contexto IA Refinado:** O prompt do Gemini foi enriquecido para distinguir tecnicamente cada modalidade. A IA agora valoriza o esforço técnico e cardiovascular no MTB, enquanto foca em aerodinâmica e cadência constante no ciclismo de estrada.
+
+### 🛠️ Estabilidade e UX
+- **Fluxo de Decisão Linear:** Restauro do fluxo lógico: `Atividade` -> `Tipo de Bicicleta` -> `Carga/Passageiro` -> `Análise Final`.
+- **Enriquecimento de Dados:** Melhor integração do parâmetro de carga (150kg) com o tipo de modalidade escolhida para cálculos de potência estimada mais realistas.
+
 ## 🚀 O que há de novo na v3.14.0 (2026-03-03) - "Resilience & Background Sync"
 
 Esta versão foca na **resiliência de dados** e **continuidade do serviço**, eliminando paragens causadas por ficheiros corrompidos ou limites de API.

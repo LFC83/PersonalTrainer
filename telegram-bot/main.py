@@ -28,10 +28,12 @@ genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 logger.info("Gemini API configurada")
 
 # Bot Configuration
-BOT_VERSION = "3.14.0"
+BOT_VERSION = "3.15.0"
 BOT_VERSION_DESC = (
     "Gemini 429 fallback flash + load_json_safe hardened + "
-    "JobQueue sync timestamp + save_json_safe explicit close"
+    "JobQueue sync timestamp + save_json_safe explicit close + "
+    "Cycling type selector restored for all cycling activities + "
+    "MTB/Estrada/Spinning/Cidade AI prompt rules"
 )
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 DATA_DIR = '/data'
@@ -1124,7 +1126,7 @@ def clear_user_context(user_id: int):
 # ==========================================
 
 # v3.14.0: Modelo de fallback quando o modelo configurado retorna 429 (Quota Exceeded).
-GEMINI_FALLBACK_MODEL = "gemini-1.5-flash"
+GEMINI_FALLBACK_MODEL = "gemini-1.5-flash-latest"
 
 def _is_quota_error(exc: Exception) -> bool:
     """Detecta erros 429 (Quota Exceeded) do Gemini."""
@@ -1576,21 +1578,19 @@ async def analyze_activity_callback(update: Update, context: ContextTypes.DEFAUL
         is_cycling = any(x in sport_lower for x in ['cicl', 'mtb', 'spin', 'bike', 'cycling', 'road_biking'])
 
         if is_cycling:
-            is_generic_type = sport_lower in ['cycling', 'other', 'bike', 'ciclismo']
-            if is_generic_type:
-                keyboard = [
-                    [InlineKeyboardButton("🚵 MTB", callback_data=f"cycle_type_mtb_{index}")],
-                    [InlineKeyboardButton("🚴 Estrada", callback_data=f"cycle_type_estrada_{index}")],
-                    [InlineKeyboardButton("🏋️ Spinning", callback_data=f"cycle_type_spinning_{index}")],
-                    [InlineKeyboardButton("🚲 Cidade", callback_data=f"cycle_type_cidade_{index}")]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await query.edit_message_text(
-                    f"🚴 Atividade: {activity.to_brief_summary()}\n\nQue tipo de ciclismo foi?",
-                    reply_markup=reply_markup
-                )
-            else:
-                await ask_about_cargo(query, activity, index)
+            # v3.15.0: Sempre apresenta o seletor de tipo para QUALQUER atividade de ciclismo.
+            # Anteriormente limitado a tipos genéricos — restaurado para cobrir road_biking, mtb, etc.
+            keyboard = [
+                [InlineKeyboardButton("🚵 MTB", callback_data=f"cycle_type_mtb_{index}")],
+                [InlineKeyboardButton("🚴 Estrada", callback_data=f"cycle_type_estrada_{index}")],
+                [InlineKeyboardButton("🏋️ Spinning", callback_data=f"cycle_type_spinning_{index}")],
+                [InlineKeyboardButton("🚲 Cidade", callback_data=f"cycle_type_cidade_{index}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                f"🚴 Atividade: {activity.to_brief_summary()}\n\nQue tipo de ciclismo foi?",
+                reply_markup=reply_markup
+            )
         else:
             await perform_activity_analysis(query, activity, has_cargo=False, cycling_type=None)
 
@@ -1693,6 +1693,38 @@ async def perform_activity_analysis(query, activity: 'FormattedActivity', has_ca
                 "Ignora comparações com recordes de velocidade pessoal.\n"
             )
 
+        # v3.15.0: Regras de análise específicas por tipo de ciclismo injetadas no prompt
+        cycling_type_instruction = ""
+        if cycling_type:
+            ct = cycling_type.lower()
+            if ct == "mtb":
+                cycling_type_instruction = (
+                    "\nREGRA MTB: Valoriza o esforço cardiovascular e técnico acrescido pelo terreno irregular. "
+                    "Considera que a potência efectiva é 15-25% superior ao indicado por dados de estrada equivalentes. "
+                    "Analisa o impacto neurológico (equilíbrio, reacção) e a fadiga muscular excêntrica das descidas. "
+                    "Compara cadência com o óptimo MTB (70-85 RPM em subida técnica).\n"
+                )
+            elif ct == "estrada":
+                cycling_type_instruction = (
+                    "\nREGRA ESTRADA: Foca em aerodinâmica e cadência constante. "
+                    "Cadência óptima em estrada: 85-95 RPM em plano, 70-80 RPM em subida. "
+                    "Analisa deriva cardíaca como indicador de eficiência aeróbia. "
+                    "Avalia consistência de velocidade/potência como indicador de forma.\n"
+                )
+            elif ct == "spinning":
+                cycling_type_instruction = (
+                    "\nREGRA SPINNING: Contexto indoor sem variação climática. "
+                    "Foca na análise de zonas de FC e progressão de carga por intervalos. "
+                    "Compara esforço percebido com resposta cardíaca real. "
+                    "Sem análise altimétrica real — usa FC como único indicador de intensidade.\n"
+                )
+            elif ct == "cidade":
+                cycling_type_instruction = (
+                    "\nREGRA CIDADE: Ciclismo urbano com arranques e paragens frequentes. "
+                    "Considera baixa eficiência metabólica por dinâmica stop-and-go. "
+                    "Foca em volume total e calorias. Não uses cadência como métrica primária.\n"
+                )
+
         prompt = f"""
 {bio_context}
 
@@ -1706,7 +1738,7 @@ Calorias: {activity.calories or 'sem dados'}kcal
 Ganho Altimétrico: {elev_str}
 Cadência Média: {cad_str}
 {f"Peso total estimado: {peso_total}kg" if peso_total else ""}
-{cargo_instruction}
+{cargo_instruction}{cycling_type_instruction}
 ### TAREFA (/analyze_activity — ANÁLISE TÉCNICA EXCLUSIVA):
 Analisa esta sessão realizada. FOCA EXCLUSIVAMENTE em:
 1. Eficiência de Cadência: {cad_str} vs óptimo para este tipo de esforço (mostra cálculo)
@@ -1933,13 +1965,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/debug - Informações de debug\n"
         "/health - Health check do sistema\n"
         "/help - Esta ajuda\n\n"
-        "🆕 v3.14.0:\n"
-        "• /sync e /import: resposta imediata, notificação via JobQueue\n"
-        "• HRV trend com setas ↑↓= na tendência de 5 dias\n"
-        "• Aviso automático quando biometria é de ontem (stale)\n"
-        "• Backup automático activities.json.bak antes de qualquer escrita\n"
-        "• Cleanup de flags penduradas >24h no arranque e no /sync\n"
-        "• Cálculo de 150kg explícito na análise de ciclismo com carga"
+        "🆕 v3.15.0:\n"
+        "• Seletor de tipo de ciclismo restaurado para TODAS as atividades de ciclismo\n"
+        "• Regras de análise específicas por tipo: MTB, Estrada, Spinning, Cidade\n"
+        "• MTB: valoriza esforço técnico e cardiovascular em terreno irregular\n"
+        "• Estrada: foca em cadência constante e eficiência aerodinâmica\n"
+        "• Mantidas todas as melhorias de sincronização e segurança da v3.14\n"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2086,6 +2117,8 @@ def main():
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
     logger.info(f"✅ Bot v{BOT_VERSION} iniciado")
+    logger.info(f"  - Seletor de tipo ciclismo para todas as atividades cycling")
+    logger.info(f"  - Regras AI: MTB/Estrada/Spinning/Cidade injetadas no prompt")
     logger.info(f"  - JobQueue async flag watcher ({JOB_QUEUE_INTERVAL_SECONDS}s)")
     logger.info(f"  - Stale biometrics flag + aviso IA")
     logger.info(f"  - Backup automático activities.json.bak")
