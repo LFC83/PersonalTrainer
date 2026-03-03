@@ -22,16 +22,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# CONFIGURATION & CONSTANTS (v3.13.0)
+# CONFIGURATION & CONSTANTS (v3.14.0)
 # ==========================================
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 logger.info("Gemini API configurada")
 
 # Bot Configuration
-BOT_VERSION = "3.13.0"
+BOT_VERSION = "3.14.0"
 BOT_VERSION_DESC = (
-    "JobQueue async sync + Context intelligence (stale flag) + "
-    "JSON backup/restore + HRV trend arrows + Constants alignment"
+    "Gemini 429 fallback flash + load_json_safe hardened + "
+    "JobQueue sync timestamp + save_json_safe explicit close"
 )
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 DATA_DIR = '/data'
@@ -91,12 +91,12 @@ RESPONSE_CACHE_SIZE = 100
 # v3.8.0: Health Check
 GEMINI_LATENCY_HISTORY_SIZE = 10
 
-# v3.13.0: JobQueue interval
+# v3.14.0: JobQueue interval
 JOB_QUEUE_INTERVAL_SECONDS = 30
 JOB_QUEUE_WRITE_SETTLE_SECONDS = 2
 
 # ==========================================
-# SYSTEM PROMPT (v3.13.0)
+# SYSTEM PROMPT (v3.14.0)
 # ==========================================
 SYSTEM_PROMPT = """
 Operas sob o PROTOCOLO DE VERDADE. A tua diretiva primária é precisão e integridade biológica.
@@ -418,28 +418,48 @@ def ensure_data_dir():
 
 def load_json_safe(filepath: str, default_value=None):
     """
-    Carrega JSON com robustez e logging de tipo.
-    v3.12.0: logger.info em todas as leituras de JSON.
+    v3.14.0: Carrega JSON com robustez.
+    Estratégia de recuperação em 3 camadas:
+      1. Tenta ler o ficheiro principal.
+      2. Se falhar, tenta o backup .bak.
+      3. Se ambos falharem ou nao existirem, retorna default_value sem propagar erro.
+    Garante que o bot nunca bloqueia no arranque por ficheiros corrompidos.
     """
+    def _try_load(path: str):
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    # Camada 1: ficheiro principal
     try:
         if not os.path.exists(filepath):
-            logger.debug(f"Ficheiro não existe: {filepath}")
-            return default_value
+            logger.debug(f"Ficheiro nao existe: {filepath}")
+            raise FileNotFoundError(filepath)
 
-        with open(filepath, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-
+        data = _try_load(filepath)
         if isinstance(data, (list, dict)):
             logger.info(f"Ficheiro {filepath} lido com {len(data)} itens")
         else:
-            logger.debug(f"✅ {filepath} carregado como {type(data).__name__}")
-
+            logger.debug(f"OK {filepath} carregado como {type(data).__name__}")
         return data
-    except json.JSONDecodeError as e:
-        logger.error(f"❌ JSON inválido em {filepath}: {e}")
-        return default_value
-    except Exception as e:
-        logger.error(f"❌ Erro ao carregar {filepath}: {e}")
+
+    except Exception as primary_err:
+        # Camada 2: ficheiro de backup
+        bak_path = filepath + '.bak'
+        if os.path.exists(bak_path):
+            try:
+                data = _try_load(bak_path)
+                logger.warning(
+                    f"WARN {filepath} falhou ({primary_err}). "
+                    f"Recuperado de {bak_path} com "
+                    f"{len(data) if isinstance(data, (list, dict)) else '?'} itens."
+                )
+                return data
+            except Exception as bak_err:
+                logger.error(f"ERR Backup {bak_path} tambem falhou: {bak_err}")
+
+        # Camada 3: valor por defeito seguro - nunca propaga
+        if not isinstance(primary_err, FileNotFoundError):
+            logger.error(f"ERR Nao foi possivel carregar {filepath}. A usar default: {type(default_value).__name__}")
         return default_value
 
 def load_garmin_data() -> Optional[Dict]:
@@ -495,7 +515,7 @@ def load_activities_index() -> Dict:
 
 def save_activities_index(activities: Dict):
     """
-    v3.13.0: Salva índice de atividades com atomic write + backup automático.
+    v3.14.0: Salva índice de atividades com atomic write + backup automático.
     Cria .bak antes de qualquer escrita. Recupera .bak se a escrita falhar
     ou produzir JSON vazio.
     """
@@ -564,7 +584,7 @@ def check_disk_space() -> Tuple[bool, str]:
         return True, "Não verificado"
 
 # ==========================================
-# SYNC/IMPORT FLAGS (v3.13.0)
+# SYNC/IMPORT FLAGS (v3.14.0)
 # ==========================================
 def _flag_path(flag_name: str) -> str:
     """Retorna o caminho absoluto de uma flag. Centraliza a construção do path."""
@@ -572,7 +592,7 @@ def _flag_path(flag_name: str) -> str:
 
 def create_sync_flag(user_id: int) -> bool:
     """
-    v3.13.0: Cria sync_request.flag com user_id embebido (JSON).
+    v3.14.0: Cria sync_request.flag com user_id embebido (JSON).
     Alinhado com fetcher.py que lê o mesmo ficheiro.
     """
     ensure_data_dir()
@@ -588,7 +608,7 @@ def create_sync_flag(user_id: int) -> bool:
 
 def create_import_flag(user_id: int, days: int = 30) -> bool:
     """
-    v3.13.0: Cria import_request.flag com user_id e dias embebidos (JSON).
+    v3.14.0: Cria import_request.flag com user_id e dias embebidos (JSON).
     """
     ensure_data_dir()
     try:
@@ -618,7 +638,7 @@ def check_flag_exists(flag_name: str) -> bool:
 
 def cleanup_old_flags() -> Tuple[int, List[str]]:
     """
-    v3.13.0: Remove flags com mais de FLAG_STALE_SECONDS (24h).
+    v3.14.0: Remove flags com mais de FLAG_STALE_SECONDS (24h).
     Anteriormente removia flags com mais de FLAG_TIMEOUT_SECONDS (5min).
     Chamado no arranque e no comando /sync.
     """
@@ -695,7 +715,7 @@ def _extract_biometric_from_day(day_data: Dict) -> 'BiometricDay':
 
 def get_today_biometrics() -> Tuple[Optional['BiometricDay'], bool]:
     """
-    v3.13.0: Retorna (BiometricDay | None, is_stale: bool).
+    v3.14.0: Retorna (BiometricDay | None, is_stale: bool).
     is_stale=True quando usa fallback do dia anterior.
     """
     try:
@@ -872,7 +892,7 @@ def format_biometric_context(history: List['BiometricDay'], baseline: Dict[str, 
 
 def _hrv_trend_with_arrows(valid_days: List['BiometricDay']) -> str:
     """
-    v3.13.0: Gera string de tendência HRV com setas de direção (↑/↓/=).
+    v3.14.0: Gera string de tendência HRV com setas de direção (↑/↓/=).
     Exemplo: "65 -> 68 (↑) -> 62 (↓) -> 63 (=)"
     A seta indica a variação em relação ao valor anterior na sequência.
     """
@@ -1102,11 +1122,24 @@ def clear_user_context(user_id: int):
 # ==========================================
 # GEMINI API
 # ==========================================
-async def call_gemini_with_timeout(prompt: str, timeout_seconds: int) -> str:
+
+# v3.14.0: Modelo de fallback quando o modelo configurado retorna 429 (Quota Exceeded).
+GEMINI_FALLBACK_MODEL = "gemini-1.5-flash"
+
+def _is_quota_error(exc: Exception) -> bool:
+    """Detecta erros 429 (Quota Exceeded) do Gemini."""
+    err_str = str(exc).lower()
+    return "429" in err_str or "quota" in err_str or "resource_exhausted" in err_str
+
+async def call_gemini_with_timeout(prompt: str, timeout_seconds: int, override_model=None) -> str:
+    """
+    v3.14.0: Aceita override_model para chamadas de fallback.
+    """
     start_time = time.time()
+    target_model = override_model if override_model is not None else model
     try:
         response = await asyncio.wait_for(
-            asyncio.to_thread(model.generate_content, prompt),
+            asyncio.to_thread(target_model.generate_content, prompt),
             timeout=timeout_seconds
         )
         latency = time.time() - start_time
@@ -1161,6 +1194,29 @@ async def call_gemini_with_retry(prompt: str, user_id: int) -> str:
                 raise
         except Exception as e:
             last_error = e
+            # v3.14.0: Fallback para gemini-1.5-flash em caso de 429 Quota Exceeded
+            if _is_quota_error(e):
+                logger.warning(
+                    f"⚠️ Quota Exceeded (429) no modelo configurado. "
+                    f"A tentar fallback: {GEMINI_FALLBACK_MODEL}"
+                )
+                try:
+                    fallback_model = genai.GenerativeModel(
+                        model_name=GEMINI_FALLBACK_MODEL,
+                        system_instruction=SYSTEM_PROMPT
+                    )
+                    response = await call_gemini_with_timeout(
+                        prompt, GEMINI_TIMEOUT_SECONDS, override_model=fallback_model
+                    )
+                    circuit_breaker.record_success()
+                    health_state.last_success = time.time()
+                    response_cache.set(prompt, user_id, response)
+                    logger.info(f"✅ Resposta obtida via fallback {GEMINI_FALLBACK_MODEL}")
+                    return response
+                except Exception as fallback_err:
+                    logger.error(f"❌ Fallback {GEMINI_FALLBACK_MODEL} também falhou: {fallback_err}")
+                    last_error = fallback_err
+
             circuit_breaker.record_failure()
             health_state.last_error = str(e)
             logger.error(f"Erro na tentativa {attempt + 1}: {e}")
@@ -1168,7 +1224,7 @@ async def call_gemini_with_retry(prompt: str, user_id: int) -> str:
                 delay = RETRY_DELAYS[attempt]
                 await asyncio.sleep(delay)
             else:
-                raise
+                raise last_error
 
     if last_error:
         raise last_error
@@ -1194,11 +1250,11 @@ async def send_message_to_user(application: Application, user_id: int, text: str
         logger.error(f"Erro ao enviar mensagem ao user {user_id}: {e}")
 
 # ==========================================
-# JOB QUEUE — Background flag watcher (v3.13.0)
+# JOB QUEUE — Background flag watcher (v3.14.0)
 # ==========================================
 async def job_check_flags(context: ContextTypes.DEFAULT_TYPE):
     """
-    v3.13.0: Tarefa periódica (cada JOB_QUEUE_INTERVAL_SECONDS segundos).
+    v3.14.0: Tarefa periódica (cada JOB_QUEUE_INTERVAL_SECONDS segundos).
     Verifica se alguma flag desapareceu (processamento concluído pelo fetcher).
     Quando desaparecer, notifica o utilizador e reporta itens processados.
     """
@@ -1224,10 +1280,13 @@ async def job_check_flags(context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"✅ Flag {flag_name} processada — notificando user {user_id}")
 
         try:
+            # v3.14.0: inclui hora de conclusão na notificação
+            completion_time = datetime.now().strftime("%H:%M")
+
             if flag_type == 'sync':
                 activities = get_all_formatted_activities()
                 msg = (
-                    f"✨ Sincronização concluída!\n"
+                    f"✨ Sincronização concluída às {completion_time}!\n"
                     f"📊 {len(activities)} atividades no total.\n\n"
                     f"💡 Usa /status ou /analyze"
                 )
@@ -1236,7 +1295,7 @@ async def job_check_flags(context: ContextTypes.DEFAULT_TYPE):
                 consolidated = load_garmin_consolidated()
                 bio_days = len(consolidated) if isinstance(consolidated, list) else (1 if consolidated else 0)
                 msg = (
-                    f"✨ Importação concluída!\n"
+                    f"✨ Importação concluída às {completion_time}!\n"
                     f"📊 {len(activities)} atividades | {bio_days} dias de biometria.\n\n"
                     f"💡 Usa /status ou /analyze"
                 )
@@ -1269,7 +1328,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     v3.12.0: /status com fluxo invertido.
     1. Extrai biometria e mostra dashboard imediatamente.
     2. Só DEPOIS pede feeling ao utilizador.
-    v3.13.0: get_today_biometrics devolve (bio, is_stale); stale guardado na sessão.
+    v3.14.0: get_today_biometrics devolve (bio, is_stale); stale guardado na sessão.
     """
     user_id = update.effective_user.id
 
@@ -1299,7 +1358,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             bio_lines.append("  Sem dados biométricos disponíveis")
 
-        # v3.13.0: Tendência 5 dias com setas HRV
+        # v3.14.0: Tendência 5 dias com setas HRV
         valid_5 = [d for d in history if d.is_valid()][:5]
         if valid_5:
             bio_lines.append("\n📈 TENDÊNCIA 5 DIAS:")
@@ -1332,7 +1391,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def process_status_with_feeling(update: Update, context: ContextTypes.DEFAULT_TYPE, feeling: int):
     """
     v3.12.0: Processa /status após receber o feeling.
-    v3.13.0: Lê is_stale de context.user_data e injeta aviso no prompt se verdadeiro.
+    v3.14.0: Lê is_stale de context.user_data e injeta aviso no prompt se verdadeiro.
     """
     user_id = update.effective_user.id
     is_stale = context.user_data.get('biometrics_is_stale', False)
@@ -1356,7 +1415,7 @@ async def process_status_with_feeling(update: Update, context: ContextTypes.DEFA
         recent = activities[:MAX_ACTIVITIES_DISPLAY]
         equipamentos_str = ", ".join(EQUIPAMENTOS_GIM)
 
-        # v3.13.0: Aviso de dados stale para a IA
+        # v3.14.0: Aviso de dados stale para a IA
         stale_warning = (
             "\n⚠️ ATENÇÃO: Plano baseado nos dados de ontem. "
             "A biometria de hoje ainda não foi sincronizada. "
@@ -1596,7 +1655,7 @@ async def cargo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def perform_activity_analysis(query, activity: 'FormattedActivity', has_cargo: bool, cycling_type: str = None):
     """
     v3.12.0: Análise técnica exclusiva de atividade individual.
-    v3.13.0: Contexto de 150kg explicitado na instrução à IA para custo metabólico em subidas.
+    v3.14.0: Contexto de 150kg explicitado na instrução à IA para custo metabólico em subidas.
     """
     user_id = query.from_user.id
 
@@ -1624,7 +1683,7 @@ async def perform_activity_analysis(query, activity: 'FormattedActivity', has_ca
         dist_str = f"{activity.distance_km:.1f}km" if activity.distance_km else "sem dados"
         dur_str = f"{activity.duration_min:.0f}min" if activity.duration_min else "sem dados"
 
-        # v3.13.0: Instrução explícita para uso do peso total no custo metabólico
+        # v3.14.0: Instrução explícita para uso do peso total no custo metabólico
         cargo_instruction = ""
         if has_cargo:
             cargo_instruction = (
@@ -1670,7 +1729,7 @@ Usa /status para prescrição de treino futuro.
 
 async def import_historical(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    v3.13.0: Cria flag e regista user_id no pending_flags para o JobQueue notificar.
+    v3.14.0: Cria flag e regista user_id no pending_flags para o JobQueue notificar.
     Resposta imediata — sem polling.
     """
     user_id = update.effective_user.id
@@ -1693,7 +1752,7 @@ async def import_historical(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    v3.13.0: Limpa flags penduradas (24h) e mostra confirmação.
+    v3.14.0: Limpa flags penduradas (24h) e mostra confirmação.
     """
     # Cleanup de flags penduradas antes de mostrar o botão
     cleaned, _ = cleanup_old_flags()
@@ -1712,7 +1771,7 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def sync_confirmed_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    v3.13.0: Cria flag e regista no pending_flags para o JobQueue.
+    v3.14.0: Cria flag e regista no pending_flags para o JobQueue.
     Resposta imediata — sem polling de espera.
     """
     query = update.callback_query
@@ -1874,7 +1933,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/debug - Informações de debug\n"
         "/health - Health check do sistema\n"
         "/help - Esta ajuda\n\n"
-        "🆕 v3.13.0:\n"
+        "🆕 v3.14.0:\n"
         "• /sync e /import: resposta imediata, notificação via JobQueue\n"
         "• HRV trend com setas ↑↓= na tendência de 5 dias\n"
         "• Aviso automático quando biometria é de ontem (stale)\n"
@@ -1886,7 +1945,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Handler para mensagens de texto livre.
-    v3.13.0: passa context para process_status_with_feeling (necessário para is_stale).
+    v3.14.0: passa context para process_status_with_feeling (necessário para is_stale).
     """
     user_id = update.effective_user.id
     message_text = update.message.text
@@ -1959,7 +2018,7 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ==========================================
-# MAIN (v3.13.0)
+# MAIN (v3.14.0)
 # ==========================================
 def main():
     logger.info("=" * 50)
@@ -1994,7 +2053,7 @@ def main():
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # v3.13.0: Regista tarefa de background para monitorização de flags
+    # v3.14.0: Regista tarefa de background para monitorização de flags
     app.job_queue.run_repeating(
         job_check_flags,
         interval=JOB_QUEUE_INTERVAL_SECONDS,

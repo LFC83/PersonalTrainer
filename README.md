@@ -125,6 +125,16 @@ EN: How do I clear pending requests?
 
 # Changelog
 
+## 🚀 O que há de novo na v3.14.0 (2026-03-03) - "Resilience & Background Sync"
+
+Esta versão foca na **resiliência de dados** e **continuidade do serviço**, eliminando paragens causadas por ficheiros corrompidos ou limites de API.
+
+* **Recuperação Automática de Dados:** Implementação de um sistema de 3 camadas em ficheiros JSON (Original -> Backup -> Fallback Vazio). O bot já não bloqueia se um ficheiro estiver corrompido.
+* **Inteligência de Quotas (Gemini):** Sistema de fallback dinâmico. Se o modelo principal atingir o limite de quota (Erro 429), o bot comuta automaticamente para o `gemini-1.5-flash` para garantir a resposta.
+* **Gestão de Erros de Sincronização:** As flags de pedido agora são renomeadas para `.flag.error` em caso de falha crítica do Garmin, permitindo depuração sem perder o rasto do erro.
+* **Segurança de Escrita:** Reforço no fecho de ficheiros antes de operações de rotação (backup), prevenindo conflitos de escrita em volumes Docker.
+* **UX de Background:** Notificações de conclusão de sincronização agora incluem timestamp preciso para melhor acompanhamento.
+
 ## 🚀 Versão Atual: 3.13.0 (2026-03-03) - "Resilience & Background Sync"
 
 Esta versão foca na estabilidade operacional e na integridade dos dados, introduzindo um modelo de sincronização assíncrona que elimina timeouts e melhora a experiência do utilizador.
