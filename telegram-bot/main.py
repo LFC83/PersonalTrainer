@@ -22,18 +22,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# CONFIGURATION & CONSTANTS (v3.14.0)
+# CONFIGURATION & CONSTANTS (v3.15.1)
 # ==========================================
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 logger.info("Gemini API configurada")
 
 # Bot Configuration
-BOT_VERSION = "3.15.0"
+BOT_VERSION = "3.15.1"
 BOT_VERSION_DESC = (
-    "Gemini 429 fallback flash + load_json_safe hardened + "
-    "JobQueue sync timestamp + save_json_safe explicit close + "
-    "Cycling type selector restored for all cycling activities + "
-    "MTB/Estrada/Spinning/Cidade AI prompt rules"
+    "Change fallback model, disable auto enrichment"
 )
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 DATA_DIR = '/data'
@@ -55,7 +52,7 @@ MAX_FEELING_LENGTH = 500
 MAX_ACTIVITIES_DISPLAY = 10
 MAX_ACTIVITIES_STORED = 100
 MAX_ACTIVITIES_IN_ANALYSIS = 5
-CACHE_TTL_SECONDS = 60
+CACHE_TTL_SECONDS = 300
 FLAG_TIMEOUT_SECONDS = 300
 FLAG_STALE_SECONDS = 86400  # 24h — flags penduradas
 
@@ -88,7 +85,7 @@ RATE_LIMIT_WINDOW = 60
 RATE_LIMIT_MAX_REQUESTS = 10
 
 # v3.6+: Cache
-RESPONSE_CACHE_SIZE = 100
+RESPONSE_CACHE_SIZE = 200
 
 # v3.8.0: Health Check
 GEMINI_LATENCY_HISTORY_SIZE = 10
@@ -1047,11 +1044,11 @@ def reorganize_activities() -> Tuple[int, int, List[str]]:
 
     return duplicates, len(cleaned), messages
 
-def check_and_enrich_activities():
-    activities = load_activities_index()
-    if not activities:
-        logger.debug("Sem atividades para enriquecer")
-        return
+#def check_and_enrich_activities():
+#    activities = load_activities_index()
+#    if not activities:
+#        logger.debug("Sem atividades para enriquecer")
+#        return
 
     enriched_count = 0
     for activity_id, data in activities.items():
@@ -1126,7 +1123,7 @@ def clear_user_context(user_id: int):
 # ==========================================
 
 # v3.14.0: Modelo de fallback quando o modelo configurado retorna 429 (Quota Exceeded).
-GEMINI_FALLBACK_MODEL = "gemini-1.5-flash-latest"
+GEMINI_FALLBACK_MODEL = "gemini-1.0-pro"
 
 def _is_quota_error(exc: Exception) -> bool:
     """Detecta erros 429 (Quota Exceeded) do Gemini."""
@@ -2071,8 +2068,8 @@ def main():
     else:
         logger.info(f"✅ INTEGRIDADE: {integrity_msg}")
 
-    logger.info("🔍 Verificando atividades para enriquecimento...")
-    check_and_enrich_activities()
+#    logger.info("🔍 Verificando atividades para enriquecimento...")
+#   check_and_enrich_activities()
 
     all_activities = get_all_formatted_activities()
     logger.info(f"🏃 Atividades: {len(all_activities)}")
