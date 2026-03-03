@@ -125,6 +125,20 @@ EN: How do I clear pending requests?
 
 # Changelog
 
+## 🚀 Versão Atual: 3.13.0 (2026-03-03) - "Resilience & Background Sync"
+
+Esta versão foca na estabilidade operacional e na integridade dos dados, introduzindo um modelo de sincronização assíncrona que elimina timeouts e melhora a experiência do utilizador.
+
+### 🛠️ Destaques Técnicos
+- **Asynchronous Sync Engine:** Sincronização desacoplada do fluxo principal. O bot utiliza agora uma `JobQueue` para monitorizar o progresso em background, permitindo que o utilizador continue a interagir enquanto os dados são processados.
+- **Data Integrity & Backups:** Introdução de backups atómicos (`.bak`) antes de cada escrita nos ficheiros JSON, garantindo proteção contra corrupção de dados em caso de falha do sistema.
+- **Stale Data Intelligence:** A IA agora é consciente da "frescura" dos dados. Se a biometria for de um dia anterior, o Gemini ajusta o tom e emite um aviso de segurança no plano de treino.
+- **Advanced Cycling Analysis:** Injeção de contexto específico para transporte de carga/passageiro (massa total de 150kg) para cálculos de esforço e eficiência mais realistas.
+
+### 📈 UI & UX
+- **Dynamic HRV Trends:** Visualização da tendência de 5 dias com indicadores de direção: `65 -> 68 (↑) -> 62 (↓)`.
+- **Immediate Feedback:** Respostas instantâneas nos comandos `/sync` e `/import`, com notificações automáticas assim que o processamento termina.
+
 ## 🏆 Versão Atual: 3.12.0 (2026-03-02) - "The Architect Update"
 
 Esta versão marca a maturidade do sistema de decisão, separando tecnicamente o que é **Análise de Performance** do que é **Planeamento de Treino**.

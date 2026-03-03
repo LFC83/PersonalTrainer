@@ -22,16 +22,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# CONFIGURATION & CONSTANTS (v3.12.0)
+# CONFIGURATION & CONSTANTS (v3.13.0)
 # ==========================================
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 logger.info("Gemini API configurada")
 
 # Bot Configuration
-BOT_VERSION = "3.12.0"
-BOT_VERSION_DESC = "Separação estrita de contextos IA + Cabeçalho técnico /analyze_activity + /status invertido + Fallback biométrico + Logs JSON"
+BOT_VERSION = "3.13.0"
+BOT_VERSION_DESC = (
+    "JobQueue async sync + Context intelligence (stale flag) + "
+    "JSON backup/restore + HRV trend arrows + Constants alignment"
+)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 DATA_DIR = '/data'
+
+# Flag filenames — MUST match fetcher.py exactly
+SYNC_FLAG = 'sync_request'
+IMPORT_FLAG = 'import_request'
+FLAG_EXT = '.flag'
 
 # Equipment — lista exclusiva para sugestões de treino
 EQUIPAMENTOS_GIM = [
@@ -47,6 +55,7 @@ MAX_ACTIVITIES_STORED = 100
 MAX_ACTIVITIES_IN_ANALYSIS = 5
 CACHE_TTL_SECONDS = 60
 FLAG_TIMEOUT_SECONDS = 300
+FLAG_STALE_SECONDS = 86400  # 24h — flags penduradas
 
 # Telegram API Limits
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
@@ -82,8 +91,12 @@ RESPONSE_CACHE_SIZE = 100
 # v3.8.0: Health Check
 GEMINI_LATENCY_HISTORY_SIZE = 10
 
+# v3.13.0: JobQueue interval
+JOB_QUEUE_INTERVAL_SECONDS = 30
+JOB_QUEUE_WRITE_SETTLE_SECONDS = 2
+
 # ==========================================
-# SYSTEM PROMPT (v3.12.0)
+# SYSTEM PROMPT (v3.13.0)
 # ==========================================
 SYSTEM_PROMPT = """
 Operas sob o PROTOCOLO DE VERDADE. A tua diretiva primária é precisão e integridade biológica.
@@ -201,11 +214,9 @@ class BiometricDay:
     training_load: Optional[float] = None
 
     def is_valid(self) -> bool:
-        """Verifica se tem dados mínimos para análise"""
         return self.hrv is not None and self.rhr is not None
 
     def is_empty(self) -> bool:
-        """Verifica se todos os campos estão vazios"""
         return all(v is None for v in [self.hrv, self.rhr, self.sleep, self.steps, self.training_load])
 
 @dataclass
@@ -226,7 +237,6 @@ class FormattedActivity:
     raw: Dict = field(default_factory=dict)
 
     def to_brief_summary(self) -> str:
-        """Resumo breve para UI"""
         parts = []
         if self.date:
             parts.append(self.date)
@@ -238,7 +248,6 @@ class FormattedActivity:
         return " | ".join(parts)
 
     def to_detailed_summary(self) -> str:
-        """Resumo detalhado para análise"""
         lines = [f"📅 {self.date or 'N/A'} | {self.sport}"]
         if self.duration_min:
             lines.append(f"⏱️ Duração: {self.duration_min:.0f}min")
@@ -261,7 +270,7 @@ class FormattedActivity:
 
     def to_technical_header(self) -> str:
         """
-        v3.12.0: Cabeçalho técnico para /analyze_activity (f-string, dados reais do objeto).
+        v3.12.0: Cabeçalho técnico para /analyze_activity.
         Impresso ANTES da chamada ao Gemini.
         """
         lines = []
@@ -290,7 +299,6 @@ class FormattedActivity:
 # RELIABILITY INFRASTRUCTURE (v3.6+)
 # ==========================================
 class CircuitBreaker:
-    """Circuit breaker para prevenir cascata de falhas"""
     def __init__(self):
         self.failure_count = 0
         self.last_failure_time = None
@@ -318,7 +326,6 @@ class CircuitBreaker:
         return False
 
 class RateLimiter:
-    """Rate limiter por user"""
     def __init__(self):
         self.requests = defaultdict(list)
 
@@ -331,7 +338,6 @@ class RateLimiter:
         return True
 
 class ResponseCache:
-    """Cache simples com TTL"""
     def __init__(self):
         self.cache = {}
         self.max_size = RESPONSE_CACHE_SIZE
@@ -358,7 +364,6 @@ class ResponseCache:
         self.cache[key] = (response, time.time())
 
 class HealthCheckState:
-    """Estado para health checks"""
     def __init__(self):
         self.gemini_latencies = []
         self.last_gemini_call = None
@@ -377,7 +382,6 @@ class HealthCheckState:
         return mean(self.gemini_latencies)
 
 class SessionState:
-    """Gerencia estado de sessão do usuário"""
     def __init__(self):
         self.states = {}
 
@@ -425,12 +429,10 @@ def load_json_safe(filepath: str, default_value=None):
         with open(filepath, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
-        data_type = type(data).__name__
-        # v3.12.0: info-level log em leituras de JSON
         if isinstance(data, (list, dict)):
             logger.info(f"Ficheiro {filepath} lido com {len(data)} itens")
         else:
-            logger.debug(f"✅ {filepath} carregado como {data_type}")
+            logger.debug(f"✅ {filepath} carregado como {type(data).__name__}")
 
         return data
     except json.JSONDecodeError as e:
@@ -441,16 +443,11 @@ def load_json_safe(filepath: str, default_value=None):
         return default_value
 
 def load_garmin_data() -> Optional[Dict]:
-    """Carrega dados do Garmin (garmin_dump.json)"""
     ensure_data_dir()
     path = os.path.join(DATA_DIR, 'garmin_dump.json')
     return load_json_safe(path, None)
 
 def load_garmin_consolidated():
-    """
-    Carrega dados consolidados.
-    IMPORTANTE: Este ficheiro pode ser LISTA ou DICT.
-    """
     ensure_data_dir()
     path = os.path.join(DATA_DIR, 'garmin_data_consolidated.json')
     data = load_json_safe(path, None)
@@ -497,7 +494,11 @@ def load_activities_index() -> Dict:
     return data
 
 def save_activities_index(activities: Dict):
-    """Salva índice de atividades com atomic write."""
+    """
+    v3.13.0: Salva índice de atividades com atomic write + backup automático.
+    Cria .bak antes de qualquer escrita. Recupera .bak se a escrita falhar
+    ou produzir JSON vazio.
+    """
     ensure_data_dir()
 
     if not isinstance(activities, dict):
@@ -505,20 +506,53 @@ def save_activities_index(activities: Dict):
         raise FileOperationError(f"Activities deve ser dict, não {type(activities)}")
 
     path = os.path.join(DATA_DIR, 'activities.json')
+    bak_path = path + '.bak'
     temp_path = path + '.tmp'
+
+    # Cria backup do ficheiro actual antes de escrever
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as src, \
+                 open(bak_path, 'w', encoding='utf-8') as dst:
+                dst.write(src.read())
+            logger.debug(f"✅ Backup criado: {bak_path}")
+        except Exception as e:
+            logger.warning(f"⚠️ Não foi possível criar backup: {e}")
+
     try:
         with open(temp_path, 'w', encoding='utf-8') as f:
             json.dump(activities, f, ensure_ascii=False, indent=2)
+
+        # Valida que o temp não está vazio antes de substituir
+        temp_size = os.path.getsize(temp_path)
+        if temp_size == 0:
+            raise FileOperationError("Ficheiro temporário ficou vazio após escrita")
+
         os.replace(temp_path, path)
         logger.debug(f"✅ activities.json salvo com {len(activities)} entradas")
+
     except Exception as e:
-        logger.error(f"Erro ao salvar activities.json: {e}")
+        logger.error(f"❌ Erro ao salvar activities.json: {e}")
+        # Limpeza do temp se existir
         if os.path.exists(temp_path):
-            os.remove(temp_path)
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+        # Tentativa de recuperação via backup
+        if os.path.exists(bak_path):
+            try:
+                with open(bak_path, 'r', encoding='utf-8') as f:
+                    recovered = json.load(f)
+                logger.warning(f"⚠️ A recuperar activities.json do backup ({len(recovered)} entradas)")
+                with open(path, 'w', encoding='utf-8') as f:
+                    json.dump(recovered, f, ensure_ascii=False, indent=2)
+                logger.info("✅ activities.json recuperado do backup")
+            except Exception as rec_err:
+                logger.error(f"❌ Recuperação do backup falhou: {rec_err}")
         raise FileOperationError(f"Erro ao salvar: {e}")
 
 def check_disk_space() -> Tuple[bool, str]:
-    """Verifica espaço em disco disponível"""
     try:
         stat = os.statvfs(DATA_DIR)
         free_mb = (stat.f_bavail * stat.f_frsize) / (1024 * 1024)
@@ -530,56 +564,82 @@ def check_disk_space() -> Tuple[bool, str]:
         return True, "Não verificado"
 
 # ==========================================
-# SYNC/IMPORT FLAGS
+# SYNC/IMPORT FLAGS (v3.13.0)
 # ==========================================
-def create_sync_request() -> bool:
+def _flag_path(flag_name: str) -> str:
+    """Retorna o caminho absoluto de uma flag. Centraliza a construção do path."""
+    return os.path.join(DATA_DIR, f'{flag_name}{FLAG_EXT}')
+
+def create_sync_flag(user_id: int) -> bool:
+    """
+    v3.13.0: Cria sync_request.flag com user_id embebido (JSON).
+    Alinhado com fetcher.py que lê o mesmo ficheiro.
+    """
     ensure_data_dir()
     try:
-        flag_path = os.path.join(DATA_DIR, 'sync_request.flag')
-        with open(flag_path, 'w') as f:
-            f.write(str(int(time.time())))
-        logger.info("✅ sync_request.flag criado")
+        payload = {'user_id': user_id, 'created_at': int(time.time()), 'type': 'sync'}
+        with open(_flag_path(SYNC_FLAG), 'w') as f:
+            json.dump(payload, f)
+        logger.info(f"✅ {SYNC_FLAG}{FLAG_EXT} criado para user {user_id}")
         return True
     except Exception as e:
         logger.error(f"Erro ao criar sync flag: {e}")
         return False
 
-def create_import_request(days: int = 30) -> bool:
+def create_import_flag(user_id: int, days: int = 30) -> bool:
+    """
+    v3.13.0: Cria import_request.flag com user_id e dias embebidos (JSON).
+    """
     ensure_data_dir()
     try:
-        flag_path = os.path.join(DATA_DIR, 'import_request.flag')
-        with open(flag_path, 'w') as f:
-            f.write(f"{int(time.time())}|{days}")
-        logger.info(f"✅ import_request.flag criado (days={days})")
+        payload = {'user_id': user_id, 'created_at': int(time.time()), 'type': 'import', 'days': days}
+        with open(_flag_path(IMPORT_FLAG), 'w') as f:
+            json.dump(payload, f)
+        logger.info(f"✅ {IMPORT_FLAG}{FLAG_EXT} criado para user {user_id} (days={days})")
         return True
     except Exception as e:
         logger.error(f"Erro ao criar import flag: {e}")
         return False
 
+def read_flag_payload(flag_name: str) -> Optional[Dict]:
+    """Lê o payload JSON de uma flag. Retorna None se não existir ou inválido."""
+    path = _flag_path(flag_name)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"⚠️ Não foi possível ler payload de {flag_name}: {e}")
+        return None
+
 def check_flag_exists(flag_name: str) -> bool:
-    flag_path = os.path.join(DATA_DIR, f'{flag_name}.flag')
-    return os.path.exists(flag_path)
+    return os.path.exists(_flag_path(flag_name))
 
 def cleanup_old_flags() -> Tuple[int, List[str]]:
-    """Remove flags antigas"""
+    """
+    v3.13.0: Remove flags com mais de FLAG_STALE_SECONDS (24h).
+    Anteriormente removia flags com mais de FLAG_TIMEOUT_SECONDS (5min).
+    Chamado no arranque e no comando /sync.
+    """
     ensure_data_dir()
     cleaned = 0
     messages = []
     try:
         for filename in os.listdir(DATA_DIR):
-            if filename.endswith('.flag'):
+            if filename.endswith(FLAG_EXT):
                 flag_path = os.path.join(DATA_DIR, filename)
                 try:
                     mtime = os.path.getmtime(flag_path)
                     age = time.time() - mtime
-                    if age > FLAG_TIMEOUT_SECONDS:
+                    if age > FLAG_STALE_SECONDS:
                         os.remove(flag_path)
                         cleaned += 1
-                        messages.append(f"✅ Removido: {filename} ({age/60:.0f}min)")
+                        messages.append(f"✅ Removido (pendurado): {filename} ({age/3600:.1f}h)")
                 except Exception as e:
                     messages.append(f"⚠️ Erro em {filename}: {str(e)[:50]}")
         if cleaned == 0:
-            messages.append("Sem flags antigas")
+            messages.append("Sem flags penduradas")
     except FileNotFoundError:
         messages.append("Diretório não existe")
     except Exception as e:
@@ -587,27 +647,10 @@ def cleanup_old_flags() -> Tuple[int, List[str]]:
         messages.append(f"❌ Erro: {str(e)[:50]}")
     return cleaned, messages
 
-async def wait_for_sync_completion(query_or_update, timeout_seconds: int = 60) -> bool:
-    """Aguarda conclusão do sync/import. Aceita CallbackQuery ou Update."""
-    start_time = time.time()
-    while time.time() - start_time < timeout_seconds:
-        has_sync = check_flag_exists('sync_request')
-        has_import = check_flag_exists('import_request')
-        if not has_sync and not has_import:
-            logger.info("✅ Sync/Import completou")
-            return True
-        await asyncio.sleep(2)
-    logger.warning(f"⏱️ Timeout aguardando sync ({timeout_seconds}s)")
-    return False
-
 # ==========================================
 # GARMIN DATA PARSING (v3.12.0 — Fallback Biométrico)
 # ==========================================
-def _extract_biometric_from_day(day_data: Dict) -> BiometricDay:
-    """
-    Extrai campos biométricos de um item do consolidated.
-    Centraliza a lógica de parsing para reutilização.
-    """
+def _extract_biometric_from_day(day_data: Dict) -> 'BiometricDay':
     day_date = day_data.get('date', '')
 
     hrv = None
@@ -650,16 +693,16 @@ def _extract_biometric_from_day(day_data: Dict) -> BiometricDay:
         training_load=None
     )
 
-def get_today_biometrics() -> Optional[BiometricDay]:
+def get_today_biometrics() -> Tuple[Optional['BiometricDay'], bool]:
     """
-    v3.12.0: Obtém biometria de hoje.
-    Fallback: se não houver dados de hoje, usa o dia anterior e avisa via log.
+    v3.13.0: Retorna (BiometricDay | None, is_stale: bool).
+    is_stale=True quando usa fallback do dia anterior.
     """
     try:
         consolidated = load_garmin_consolidated()
         if not consolidated:
             logger.debug("Sem dados consolidados disponíveis")
-            return None
+            return None, False
 
         today_str = date.today().isoformat()
         yesterday_str = (date.today() - timedelta(days=1)).isoformat()
@@ -668,42 +711,39 @@ def get_today_biometrics() -> Optional[BiometricDay]:
             logger.debug(f"Procurando {today_str} em lista com {len(consolidated)} itens")
 
             day_data = next((item for item in consolidated if item.get('date') == today_str), None)
-            fallback_used = False
+            is_stale = False
 
             if day_data is None:
-                # v3.12.0: Fallback para dia anterior
                 day_data = next((item for item in consolidated if item.get('date') == yesterday_str), None)
                 if day_data:
-                    fallback_used = True
+                    is_stale = True
                     logger.warning(f"⚠️ Sem dados biométricos para hoje ({today_str}). A usar fallback: {yesterday_str}")
                 else:
-                    logger.debug(f"Sem dados para hoje nem para ontem no consolidado")
-                    return None
+                    logger.debug("Sem dados para hoje nem ontem no consolidado")
+                    return None, False
 
             bio_day = _extract_biometric_from_day(day_data)
-            if fallback_used:
-                # Preserva a data real do fallback para transparência
+            if is_stale:
                 bio_day.date = yesterday_str + " (fallback)"
 
-            logger.debug(f"Biometria extraída: HRV={bio_day.hrv}, RHR={bio_day.rhr}, Sleep={bio_day.sleep}")
-            return bio_day
+            logger.debug(f"Biometria extraída: HRV={bio_day.hrv}, RHR={bio_day.rhr}, Sleep={bio_day.sleep}, stale={is_stale}")
+            return bio_day, is_stale
 
         elif isinstance(consolidated, dict):
             logger.debug("Consolidated é dict, usando diretamente")
             bio_day = _extract_biometric_from_day(consolidated)
             bio_day.date = today_str
-            return bio_day
+            return bio_day, False
 
         else:
             logger.error(f"Consolidated tem tipo inesperado: {type(consolidated)}")
-            return None
+            return None, False
 
     except Exception as e:
         logger.error(f"Erro em get_today_biometrics: {e}\n{traceback.format_exc()}")
-        return None
+        return None, False
 
-def parse_garmin_history(data: Dict) -> List[BiometricDay]:
-    """Parse dados históricos do Garmin. Tenta primeiro o consolidado, depois o dump."""
+def parse_garmin_history(data: Dict) -> List['BiometricDay']:
     history = []
 
     try:
@@ -720,11 +760,10 @@ def parse_garmin_history(data: Dict) -> List[BiometricDay]:
                         history.append(bio_day)
 
             elif isinstance(consolidated, dict):
-                today_bio = get_today_biometrics()
+                today_bio, _ = get_today_biometrics()
                 if today_bio and not today_bio.is_empty():
                     history.append(today_bio)
 
-        # Adiciona dados do dump histórico (se existirem)
         daily_data = data.get('dailySummaries', []) if data else []
 
         for day in daily_data:
@@ -734,19 +773,13 @@ def parse_garmin_history(data: Dict) -> List[BiometricDay]:
             if any(h.date == calendar_date for h in history):
                 continue
 
-            hrv = day.get('avgWakingHeartRateVariability')
-            rhr = day.get('restingHeartRate')
-            sleep_score = day.get('sleepScore')
-            steps = day.get('totalSteps')
-            training_load = day.get('moderateIntensityMinutes')
-
             bio_day = BiometricDay(
                 date=calendar_date,
-                hrv=hrv,
-                rhr=rhr,
-                sleep=sleep_score,
-                steps=steps,
-                training_load=training_load
+                hrv=day.get('avgWakingHeartRateVariability'),
+                rhr=day.get('restingHeartRate'),
+                sleep=day.get('sleepScore'),
+                steps=day.get('totalSteps'),
+                training_load=day.get('moderateIntensityMinutes')
             )
 
             if not bio_day.is_empty():
@@ -760,17 +793,15 @@ def parse_garmin_history(data: Dict) -> List[BiometricDay]:
 
     return history
 
-def get_recent_biometrics(days: int = 7) -> List[BiometricDay]:
-    """Obtém biometria recente."""
+def get_recent_biometrics(days: int = 7) -> List['BiometricDay']:
     data = load_garmin_data()
     if not data:
-        today_bio = get_today_biometrics()
+        today_bio, _ = get_today_biometrics()
         return [today_bio] if today_bio and not today_bio.is_empty() else []
     history = parse_garmin_history(data)
     return history[:days]
 
-def calculate_biometric_baseline(history: List[BiometricDay]) -> Dict[str, float]:
-    """Calcula baseline biométrico"""
+def calculate_biometric_baseline(history: List['BiometricDay']) -> Dict[str, float]:
     if not history:
         return {}
     valid_days = [d for d in history if d.is_valid()]
@@ -792,8 +823,7 @@ def calculate_biometric_baseline(history: List[BiometricDay]) -> Dict[str, float
 
     return baseline
 
-def format_biometric_context(history: List[BiometricDay], baseline: Dict[str, float]) -> str:
-    """Formata contexto biométrico com evolução"""
+def format_biometric_context(history: List['BiometricDay'], baseline: Dict[str, float]) -> str:
     if not history:
         return "### BIOMETRIA:\nSem dados disponíveis"
 
@@ -840,7 +870,32 @@ def format_biometric_context(history: List[BiometricDay], baseline: Dict[str, fl
 
     return "\n".join(lines)
 
-def parse_activity_from_garmin(activity_raw: Dict) -> Optional[FormattedActivity]:
+def _hrv_trend_with_arrows(valid_days: List['BiometricDay']) -> str:
+    """
+    v3.13.0: Gera string de tendência HRV com setas de direção (↑/↓/=).
+    Exemplo: "65 -> 68 (↑) -> 62 (↓) -> 63 (=)"
+    A seta indica a variação em relação ao valor anterior na sequência.
+    """
+    hrv_values = [d.hrv for d in valid_days if d.hrv is not None]
+    if not hrv_values:
+        return ""
+    if len(hrv_values) == 1:
+        return f"{hrv_values[0]:.0f}"
+
+    parts = [f"{hrv_values[0]:.0f}"]
+    for i in range(1, len(hrv_values)):
+        diff = hrv_values[i] - hrv_values[i - 1]
+        if diff > 1:
+            arrow = "↑"
+        elif diff < -1:
+            arrow = "↓"
+        else:
+            arrow = "="
+        parts.append(f"{hrv_values[i]:.0f} ({arrow})")
+
+    return " -> ".join(parts)
+
+def parse_activity_from_garmin(activity_raw: Dict) -> Optional['FormattedActivity']:
     """
     Parse de atividade do Garmin com acesso seguro.
     v3.12.0: Garante extração de elevation_gain e average_cadence.
@@ -875,12 +930,10 @@ def parse_activity_from_garmin(activity_raw: Dict) -> Optional[FormattedActivity
         avg_hr = activity_raw.get('averageHR')
         calories = activity_raw.get('calories')
 
-        # v3.12.0: Extração explícita e robusta de elevation_gain
         elevation_gain = activity_raw.get('elevationGain')
         if elevation_gain is None:
             elevation_gain = activity_raw.get('totalElevationGain')
 
-        # v3.12.0: Extração explícita e robusta de average_cadence
         avg_cadence = activity_raw.get('averageBikingCadenceInRevPerMinute')
         if avg_cadence is None:
             avg_cadence = activity_raw.get('averageRunningCadenceInStepsPerMinute')
@@ -889,7 +942,7 @@ def parse_activity_from_garmin(activity_raw: Dict) -> Optional[FormattedActivity
 
         max_cadence = activity_raw.get('maxBikingCadenceInRevPerMinute')
 
-        formatted = FormattedActivity(
+        return FormattedActivity(
             date=activity_date,
             sport=sport,
             duration_min=duration_min,
@@ -902,14 +955,11 @@ def parse_activity_from_garmin(activity_raw: Dict) -> Optional[FormattedActivity
             raw=activity_raw
         )
 
-        return formatted
-
     except Exception as e:
         logger.error(f"Erro ao parsear atividade: {e}")
         return None
 
-def get_all_formatted_activities() -> List[FormattedActivity]:
-    """Obtém todas as atividades formatadas"""
+def get_all_formatted_activities() -> List['FormattedActivity']:
     activities_index = load_activities_index()
     if not activities_index:
         return []
@@ -932,19 +982,15 @@ def check_activities_integrity() -> Tuple[bool, str]:
         return False, f"Tipo inválido: {type(activities)}"
     if not activities:
         return True, "Vazio mas válido"
-    invalid_count = 0
-    for activity_id, data in activities.items():
-        if not isinstance(data, dict):
-            invalid_count += 1
-            continue
-        if 'activityId' not in data:
-            invalid_count += 1
+    invalid_count = sum(
+        1 for data in activities.values()
+        if not isinstance(data, dict) or 'activityId' not in data
+    )
     if invalid_count > 0:
         return False, f"{invalid_count}/{len(activities)} entradas inválidas"
     return True, f"{len(activities)} atividades OK"
 
 def reorganize_activities() -> Tuple[int, int, List[str]]:
-    """Reorganiza activities.json. Remove duplicados e limita tamanho."""
     activities = load_activities_index()
     messages = []
     original_count = len(activities)
@@ -980,7 +1026,6 @@ def reorganize_activities() -> Tuple[int, int, List[str]]:
     return duplicates, len(cleaned), messages
 
 def check_and_enrich_activities():
-    """Verifica e enriquece atividades se necessário"""
     activities = load_activities_index()
     if not activities:
         logger.debug("Sem atividades para enriquecer")
@@ -1076,7 +1121,6 @@ async def call_gemini_with_timeout(prompt: str, timeout_seconds: int) -> str:
         raise
 
 async def call_gemini_with_retry(prompt: str, user_id: int) -> str:
-    """Chama Gemini com retry, circuit breaker e cache"""
     if not circuit_breaker.can_proceed():
         logger.warning("Circuit breaker OPEN")
         raise CircuitBreakerOpen("Serviço temporariamente indisponível")
@@ -1131,10 +1175,9 @@ async def call_gemini_with_retry(prompt: str, user_id: int) -> str:
     raise Exception("Erro desconhecido no retry loop")
 
 # ==========================================
-# HELPERS: send long message
+# HELPERS
 # ==========================================
 async def send_long_message(target, text: str):
-    """Envia mensagem, particionando se necessário."""
     if len(text) <= TELEGRAM_SAFE_MESSAGE_LENGTH:
         await target.reply_text(text)
     else:
@@ -1142,6 +1185,74 @@ async def send_long_message(target, text: str):
                   for i in range(0, len(text), TELEGRAM_SAFE_MESSAGE_LENGTH)]
         for chunk in chunks:
             await target.reply_text(chunk)
+
+async def send_message_to_user(application: Application, user_id: int, text: str):
+    """Envia mensagem directa ao utilizador via bot (usado pelo JobQueue)."""
+    try:
+        await application.bot.send_message(chat_id=user_id, text=text)
+    except Exception as e:
+        logger.error(f"Erro ao enviar mensagem ao user {user_id}: {e}")
+
+# ==========================================
+# JOB QUEUE — Background flag watcher (v3.13.0)
+# ==========================================
+async def job_check_flags(context: ContextTypes.DEFAULT_TYPE):
+    """
+    v3.13.0: Tarefa periódica (cada JOB_QUEUE_INTERVAL_SECONDS segundos).
+    Verifica se alguma flag desapareceu (processamento concluído pelo fetcher).
+    Quando desaparecer, notifica o utilizador e reporta itens processados.
+    """
+    application = context.application
+    pending = context.bot_data.get('pending_flags', {})
+
+    if not pending:
+        return
+
+    completed_keys = []
+
+    for flag_name, info in pending.items():
+        if check_flag_exists(flag_name):
+            # Flag ainda existe — processamento em curso
+            continue
+
+        # Flag desapareceu — aguarda settle de escrita
+        await asyncio.sleep(JOB_QUEUE_WRITE_SETTLE_SECONDS)
+
+        user_id = info.get('user_id')
+        flag_type = info.get('type', flag_name)
+
+        logger.info(f"✅ Flag {flag_name} processada — notificando user {user_id}")
+
+        try:
+            if flag_type == 'sync':
+                activities = get_all_formatted_activities()
+                msg = (
+                    f"✨ Sincronização concluída!\n"
+                    f"📊 {len(activities)} atividades no total.\n\n"
+                    f"💡 Usa /status ou /analyze"
+                )
+            else:
+                activities = get_all_formatted_activities()
+                consolidated = load_garmin_consolidated()
+                bio_days = len(consolidated) if isinstance(consolidated, list) else (1 if consolidated else 0)
+                msg = (
+                    f"✨ Importação concluída!\n"
+                    f"📊 {len(activities)} atividades | {bio_days} dias de biometria.\n\n"
+                    f"💡 Usa /status ou /analyze"
+                )
+
+            if user_id:
+                await send_message_to_user(application, user_id, msg)
+
+        except Exception as e:
+            logger.error(f"Erro ao notificar user após flag {flag_name}: {e}")
+
+        completed_keys.append(flag_name)
+
+    for k in completed_keys:
+        del pending[k]
+
+    context.bot_data['pending_flags'] = pending
 
 # ==========================================
 # TELEGRAM HANDLERS
@@ -1158,19 +1269,20 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     v3.12.0: /status com fluxo invertido.
     1. Extrai biometria e mostra dashboard imediatamente.
     2. Só DEPOIS pede feeling ao utilizador.
+    v3.13.0: get_today_biometrics devolve (bio, is_stale); stale guardado na sessão.
     """
     user_id = update.effective_user.id
 
     try:
-        # v3.12.0: Mensagem de estado PT com tom de Personal Trainer
         await update.message.reply_text("⏳ A extrair biometria...")
 
-        # Carrega dados biométricos
         history = get_recent_biometrics(7)
         baseline = calculate_biometric_baseline(history)
-        today_bio = get_today_biometrics()
+        today_bio, is_stale = get_today_biometrics()
 
-        # v3.12.0: DASHBOARD BIOMÉTRICO VISÍVEL antes da pergunta
+        # Guarda is_stale na sessão para uso posterior em process_status_with_feeling
+        context.user_data['biometrics_is_stale'] = is_stale
+
         bio_lines = ["📊 HOJE:"]
         if today_bio and not today_bio.is_empty():
             if today_bio.rhr:
@@ -1182,24 +1294,22 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 bio_lines.append(f"  HRV: {today_bio.hrv:.0f}")
             if today_bio.sleep is not None:
                 bio_lines.append(f"  Sono: {today_bio.sleep}/100")
-            # Fallback warning
-            if today_bio.date and 'fallback' in str(today_bio.date):
-                bio_lines.append(f"  ⚠️ Dados de ontem (hoje sem registo)")
+            if is_stale:
+                bio_lines.append("  ⚠️ Dados de ontem (hoje sem registo)")
         else:
             bio_lines.append("  Sem dados biométricos disponíveis")
 
-        # v3.12.0: TENDÊNCIA 5 DIAS
+        # v3.13.0: Tendência 5 dias com setas HRV
         valid_5 = [d for d in history if d.is_valid()][:5]
         if valid_5:
             bio_lines.append("\n📈 TENDÊNCIA 5 DIAS:")
-            hrv_trend = " -> ".join([f"{d.hrv:.0f}" for d in valid_5 if d.hrv is not None])
+            hrv_trend = _hrv_trend_with_arrows(valid_5)
             rhr_trend = " -> ".join([f"{d.rhr}" for d in valid_5 if d.rhr is not None])
             if hrv_trend:
                 bio_lines.append(f"  HRV: {hrv_trend}")
             if rhr_trend:
                 bio_lines.append(f"  RHR: {rhr_trend}")
 
-        # v3.12.0: ÚLTIMAS 3 ATIVIDADES
         activities = get_all_formatted_activities()
         if activities:
             bio_lines.append("\n🏃 ÚLTIMAS:")
@@ -1208,7 +1318,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text("\n".join(bio_lines))
 
-        # v3.12.0: SÓ AGORA pergunta o feeling
         session_state.set_user_state(user_id, 'waiting_feeling')
         await update.message.reply_text(
             "💭 Como te sentes hoje (0-10)?\n"
@@ -1220,12 +1329,13 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session_state.clear_user_state(user_id)
         await update.message.reply_text(f"❌ Erro: {str(e)[:100]}")
 
-async def process_status_with_feeling(update: Update, feeling: int):
+async def process_status_with_feeling(update: Update, context: ContextTypes.DEFAULT_TYPE, feeling: int):
     """
     v3.12.0: Processa /status após receber o feeling.
-    Foca na prescrição de treino com cálculo de carga e equipamento restrito.
+    v3.13.0: Lê is_stale de context.user_data e injeta aviso no prompt se verdadeiro.
     """
     user_id = update.effective_user.id
+    is_stale = context.user_data.get('biometrics_is_stale', False)
 
     try:
         await update.message.reply_text("🔍 A avaliar prontidão biológica...")
@@ -1244,12 +1354,19 @@ async def process_status_with_feeling(update: Update, feeling: int):
             return
 
         recent = activities[:MAX_ACTIVITIES_DISPLAY]
-
         equipamentos_str = ", ".join(EQUIPAMENTOS_GIM)
+
+        # v3.13.0: Aviso de dados stale para a IA
+        stale_warning = (
+            "\n⚠️ ATENÇÃO: Plano baseado nos dados de ontem. "
+            "A biometria de hoje ainda não foi sincronizada. "
+            "Indica este facto na análise e nas recomendações.\n"
+            if is_stale else ""
+        )
 
         prompt = f"""
 {bio_context}
-
+{stale_warning}
 ### SENSAÇÃO SUBJETIVA DO ATLETA:
 Feeling de hoje: {feeling}/10
 
@@ -1276,7 +1393,6 @@ Usa o formato de tabela obrigatório do sistema.
 """
 
         response_text = await call_gemini_with_retry(prompt, user_id)
-
         await send_long_message(update.message, response_text)
         add_to_context_history(user_id, 'status', prompt, response_text)
         session_state.clear_user_state(user_id)
@@ -1292,7 +1408,6 @@ Usa o formato de tabela obrigatório do sistema.
         await update.message.reply_text(f"❌ Erro: {str(e)[:100]}")
 
 async def activities_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler /activities"""
     try:
         all_activities = get_all_formatted_activities()
 
@@ -1317,7 +1432,6 @@ async def activities_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"❌ Erro: {str(e)[:100]}")
 
 async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler /analyze — Análise de aderência ao plano"""
     user_id = update.effective_user.id
 
     try:
@@ -1361,10 +1475,7 @@ Se HRV/RHR indicarem sobrecarga, ALERTA e prescreve ajustes.
         await update.message.reply_text(f"❌ Erro: {str(e)[:100]}")
 
 async def analyze_activity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    v3.12.0: Handler /analyze_activity
-    Mostra lista de atividades para escolher.
-    """
+    """Handler /analyze_activity — mostra lista para escolher."""
     try:
         activities = get_all_formatted_activities()
 
@@ -1389,10 +1500,7 @@ async def analyze_activity_command(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text(f"❌ Erro: {str(e)[:100]}")
 
 async def analyze_activity_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    v3.12.0: Callback para análise de atividade.
-    Pergunta TIPO DE CICLISMO se aplicável.
-    """
+    """Callback para análise de atividade — pergunta tipo de ciclismo se aplicável."""
     query = update.callback_query
     await query.answer()
 
@@ -1432,13 +1540,12 @@ async def analyze_activity_callback(update: Update, context: ContextTypes.DEFAUL
         await query.edit_message_text(f"❌ Erro: {str(e)[:100]}")
 
 async def cycling_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback para tipo de ciclismo"""
     query = update.callback_query
     await query.answer()
 
     try:
         parts = query.data.split('_')
-        cycling_type = parts[2]  # mtb, estrada, spinning, cidade
+        cycling_type = parts[2]
         index = int(parts[3])
 
         activities = get_all_formatted_activities()
@@ -1453,8 +1560,7 @@ async def cycling_type_callback(update: Update, context: ContextTypes.DEFAULT_TY
         logger.error(f"Erro em cycling_type_callback: {e}\n{traceback.format_exc()}")
         await query.edit_message_text(f"❌ Erro: {str(e)[:100]}")
 
-async def ask_about_cargo(query, activity: FormattedActivity, index: int, cycling_type: str = None):
-    """Pergunta sobre carga/passageiro"""
+async def ask_about_cargo(query, activity: 'FormattedActivity', index: int, cycling_type: str = None):
     keyboard = [
         [InlineKeyboardButton("Sim (tinha carga/passageiro)", callback_data=f"cargo_yes_{index}_{cycling_type or 'none'}")],
         [InlineKeyboardButton("Não (solo)", callback_data=f"cargo_no_{index}_{cycling_type or 'none'}")]
@@ -1466,7 +1572,6 @@ async def ask_about_cargo(query, activity: FormattedActivity, index: int, cyclin
     )
 
 async def cargo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback para resposta sobre carga em ciclismo"""
     query = update.callback_query
     await query.answer()
 
@@ -1488,26 +1593,21 @@ async def cargo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Erro em cargo_callback: {e}\n{traceback.format_exc()}")
         await query.edit_message_text(f"❌ Erro: {str(e)[:100]}")
 
-async def perform_activity_analysis(query, activity: FormattedActivity, has_cargo: bool, cycling_type: str = None):
+async def perform_activity_analysis(query, activity: 'FormattedActivity', has_cargo: bool, cycling_type: str = None):
     """
-    v3.12.0: Análise de atividade individual.
-    Imprime cabeçalho técnico ANTES de chamar o Gemini.
-    Prompt focado exclusivamente em análise técnica — SEM tabela de treino futuro.
-    Se ciclismo com carga, usa 150kg de peso total no contexto.
+    v3.12.0: Análise técnica exclusiva de atividade individual.
+    v3.13.0: Contexto de 150kg explicitado na instrução à IA para custo metabólico em subidas.
     """
     user_id = query.from_user.id
 
     try:
-        # v3.12.0: Cabeçalho técnico impresso ANTES da chamada ao Gemini
         header = activity.to_technical_header()
         await query.edit_message_text(f"🔬 A avaliar métricas da sessão...\n\n{header}")
 
-        # Biometria de contexto
         history = get_recent_biometrics(7)
         baseline = calculate_biometric_baseline(history)
         bio_context = format_biometric_context(history, baseline)
 
-        # Contexto de carga
         cargo_context = ""
         peso_total = 150 if has_cargo else None
         if cycling_type and has_cargo:
@@ -1517,13 +1617,22 @@ async def perform_activity_analysis(query, activity: FormattedActivity, has_carg
         elif has_cargo:
             cargo_context = f"\nCarga/Passageiro: SIM (peso total estimado: 150kg)"
 
-        # v3.12.0: Dados técnicos explícitos para injeção no prompt
         elev_str = f"{activity.elevation_gain:.0f}m" if activity.elevation_gain else "sem dados"
         cad_val = activity.avg_cadence or activity.bike_cadence
         cad_str = f"{cad_val} RPM" if cad_val else "sem dados"
         hr_str = f"{activity.avg_hr}bpm" if activity.avg_hr else "sem dados"
         dist_str = f"{activity.distance_km:.1f}km" if activity.distance_km else "sem dados"
         dur_str = f"{activity.duration_min:.0f}min" if activity.duration_min else "sem dados"
+
+        # v3.13.0: Instrução explícita para uso do peso total no custo metabólico
+        cargo_instruction = ""
+        if has_cargo:
+            cargo_instruction = (
+                "\nIMPORTANTE: O utilizador levou um passageiro. "
+                "Usa 150kg como massa total (bike + condutor + carga) para calcular "
+                "o custo metabólico em subidas (W/kg e fadiga acumulada). "
+                "Ignora comparações com recordes de velocidade pessoal.\n"
+            )
 
         prompt = f"""
 {bio_context}
@@ -1538,7 +1647,7 @@ Calorias: {activity.calories or 'sem dados'}kcal
 Ganho Altimétrico: {elev_str}
 Cadência Média: {cad_str}
 {f"Peso total estimado: {peso_total}kg" if peso_total else ""}
-
+{cargo_instruction}
 ### TAREFA (/analyze_activity — ANÁLISE TÉCNICA EXCLUSIVA):
 Analisa esta sessão realizada. FOCA EXCLUSIVAMENTE em:
 1. Eficiência de Cadência: {cad_str} vs óptimo para este tipo de esforço (mostra cálculo)
@@ -1560,19 +1669,37 @@ Usa /status para prescrição de treino futuro.
         await query.message.reply_text(f"❌ Erro: {str(e)[:100]}")
 
 async def import_historical(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler /import"""
+    """
+    v3.13.0: Cria flag e regista user_id no pending_flags para o JobQueue notificar.
+    Resposta imediata — sem polling.
+    """
+    user_id = update.effective_user.id
     try:
-        await update.message.reply_text("🔄 A processar importação histórica...")
-        if not create_import_request(days=30):
+        if not create_import_flag(user_id, days=30):
             await update.message.reply_text("❌ Erro ao criar pedido de importação")
             return
-        asyncio.create_task(send_sync_feedback(update, 'import_request'))
+
+        # Regista no pending_flags para o JobQueue monitorizar
+        pending = context.bot_data.setdefault('pending_flags', {})
+        pending[IMPORT_FLAG] = {'user_id': user_id, 'type': 'import', 'created_at': time.time()}
+
+        await update.message.reply_text(
+            "✅ Pedido enviado. O processamento corre em background.\n"
+            "Vou avisar-te assim que os dados chegarem."
+        )
     except Exception as e:
         logger.error(f"Erro em /import: {e}")
         await update.message.reply_text(f"❌ Erro: {str(e)[:100]}")
 
 async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler /sync"""
+    """
+    v3.13.0: Limpa flags penduradas (24h) e mostra confirmação.
+    """
+    # Cleanup de flags penduradas antes de mostrar o botão
+    cleaned, _ = cleanup_old_flags()
+    if cleaned > 0:
+        logger.info(f"⚠️ /sync: {cleaned} flags penduradas removidas")
+
     keyboard = [
         [InlineKeyboardButton("✅ Sim, sincronizar", callback_data="sync_confirmed")],
         [InlineKeyboardButton("❌ Cancelar", callback_data="sync_cancel")]
@@ -1584,47 +1711,33 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def sync_confirmed_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback de confirmação de sync"""
+    """
+    v3.13.0: Cria flag e regista no pending_flags para o JobQueue.
+    Resposta imediata — sem polling de espera.
+    """
     query = update.callback_query
     await query.answer()
+    user_id = query.from_user.id
 
     try:
-        await query.edit_message_text("🔄 A processar sincronização...")
-        if not create_sync_request():
+        await query.edit_message_text("🔄 A registar pedido de sincronização...")
+
+        if not create_sync_flag(user_id):
             await query.message.reply_text("❌ Erro ao criar pedido de sync")
             return
-        asyncio.create_task(send_sync_feedback(query, 'sync_request'))
+
+        pending = context.bot_data.setdefault('pending_flags', {})
+        pending[SYNC_FLAG] = {'user_id': user_id, 'type': 'sync', 'created_at': time.time()}
+
+        await query.message.reply_text(
+            "✅ Pedido enviado. O processamento corre em background.\n"
+            "Vou avisar-te assim que os dados chegarem."
+        )
     except Exception as e:
         logger.error(f"Erro em sync_confirmed_callback: {e}")
         await query.message.reply_text(f"❌ Erro: {str(e)[:100]}")
 
-async def send_sync_feedback(query_or_update, flag_name: str):
-    """Envia feedback após sincronização. Aceita CallbackQuery ou Update."""
-    try:
-        completed = await wait_for_sync_completion(query_or_update, timeout_seconds=60)
-        message = query_or_update.message
-
-        if not completed:
-            await message.reply_text("⏱️ Sincronização ainda em progresso...\nUsa /activities para ver o estado.")
-            return
-
-        activities = get_all_formatted_activities()
-        if activities:
-            msg = (
-                f"✅ Sincronização concluída!\n"
-                f"📊 {len(activities)} atividades no total encontradas.\n\n"
-                f"💡 Usa /status ou /analyze"
-            )
-        else:
-            msg = "⚠️ Sincronização completou mas sem atividades encontradas."
-
-        await message.reply_text(msg)
-
-    except Exception as e:
-        logger.error(f"Erro no feedback de sync: {e}\n{traceback.format_exc()}")
-
 async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler /cleanup"""
     try:
         await update.message.reply_text("🧹 A limpar...")
         cleaned, messages = cleanup_old_flags()
@@ -1636,7 +1749,6 @@ async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Erro: {str(e)[:100]}")
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler /history"""
     user_id = update.effective_user.id
     try:
         context_data = load_context_from_disk(user_id)
@@ -1657,7 +1769,6 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Erro: {str(e)[:100]}")
 
 async def clear_context_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler /clear_context"""
     user_id = update.effective_user.id
     try:
         clear_user_context(user_id)
@@ -1668,7 +1779,6 @@ async def clear_context_command(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(f"❌ Erro: {str(e)[:100]}")
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler /stats"""
     try:
         activities = get_all_formatted_activities()
         history = get_recent_biometrics(7)
@@ -1688,17 +1798,18 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Erro: {str(e)[:100]}")
 
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler /debug"""
     try:
         activities = get_all_formatted_activities()
         history = get_recent_biometrics(7)
         disk_ok, disk_msg = check_disk_space()
         integrity_ok, integrity_msg = check_activities_integrity()
+        pending = context.bot_data.get('pending_flags', {})
         msg = f"🔧 DEBUG v{BOT_VERSION}:\n\n"
         msg += f"Atividades: {len(activities)}\n"
         msg += f"Biometria: {len(history)} dias\n"
         msg += f"Disco: {disk_msg}\n"
-        msg += f"Integridade: {integrity_msg}\n\n"
+        msg += f"Integridade: {integrity_msg}\n"
+        msg += f"Flags pendentes: {list(pending.keys()) or 'nenhuma'}\n\n"
         msg += f"Circuit Breaker: {circuit_breaker.state}\n"
         msg += f"Falhas: {circuit_breaker.failure_count}\n\n"
         avg_latency = health_state.get_avg_latency()
@@ -1715,12 +1826,11 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Erro: {str(e)[:100]}")
 
 async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler /health"""
     try:
         activities = get_all_formatted_activities()
         valid_activities = [a for a in activities if a.date]
         history = get_recent_biometrics(7)
-        today_bio = get_today_biometrics()
+        today_bio, is_stale = get_today_biometrics()
         disk_ok, disk_msg = check_disk_space()
         status_emoji = "✅" if disk_ok and activities else "⚠️"
         msg = f"{status_emoji} HEALTH CHECK v{BOT_VERSION}:\n\n"
@@ -1728,14 +1838,15 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"- Atividades: {len(activities)} ({len(valid_activities)} válidas)\n"
         msg += f"- Biometria: {len(history)} dias\n"
         if today_bio and not today_bio.is_empty():
-            msg += f"- Última biometria: {today_bio.date}\n"
+            stale_tag = " (stale)" if is_stale else ""
+            msg += f"- Última biometria: {today_bio.date}{stale_tag}\n"
             if today_bio.hrv:
                 msg += f"  HRV: {today_bio.hrv:.0f}\n"
             if today_bio.rhr:
                 msg += f"  RHR: {today_bio.rhr}bpm\n"
         else:
-            msg += f"- Última biometria: SEM DADOS\n"
-        msg += f"\n💾 SISTEMA:\n"
+            msg += "- Última biometria: SEM DADOS\n"
+        msg += "\n💾 SISTEMA:\n"
         msg += f"- Disco: {disk_msg}\n"
         msg += f"- Circuit Breaker: {circuit_breaker.state}\n"
         avg_latency = health_state.get_avg_latency()
@@ -1747,7 +1858,6 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Erro: {str(e)[:100]}")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler /help"""
     await update.message.reply_text(
         f"🏋️ FitnessJournal v{BOT_VERSION}\n\n"
         "COMANDOS:\n"
@@ -1764,20 +1874,19 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/debug - Informações de debug\n"
         "/health - Health check do sistema\n"
         "/help - Esta ajuda\n\n"
-        "🆕 v3.12.0:\n"
-        "• /status: dashboard biométrico visível antes do feeling\n"
-        "• /analyze_activity: cabeçalho técnico antes do Gemini\n"
-        "• Separação estrita de contextos IA (análise vs prescrição)\n"
-        "• Fallback biométrico para dia anterior com aviso\n"
-        "• Logs JSON com contagem de itens (logger.info)\n"
-        "• Extração robusta de elevation_gain e cadência\n"
-        "• Equipamento restrito ao EQUIPAMENTOS_GIM"
+        "🆕 v3.13.0:\n"
+        "• /sync e /import: resposta imediata, notificação via JobQueue\n"
+        "• HRV trend com setas ↑↓= na tendência de 5 dias\n"
+        "• Aviso automático quando biometria é de ontem (stale)\n"
+        "• Backup automático activities.json.bak antes de qualquer escrita\n"
+        "• Cleanup de flags penduradas >24h no arranque e no /sync\n"
+        "• Cálculo de 150kg explícito na análise de ciclismo com carga"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Handler para mensagens de texto livre.
-    Verifica se está aguardando feeling para /status.
+    v3.13.0: passa context para process_status_with_feeling (necessário para is_stale).
     """
     user_id = update.effective_user.id
     message_text = update.message.text
@@ -1789,7 +1898,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 feeling = int(message_text.strip())
                 if 0 <= feeling <= 10:
-                    await process_status_with_feeling(update, feeling)
+                    await process_status_with_feeling(update, context, feeling)
                     return
                 else:
                     await update.message.reply_text("❌ Por favor, responde com um número entre 0 e 10.")
@@ -1850,10 +1959,9 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ==========================================
-# MAIN (v3.12.0)
+# MAIN (v3.13.0)
 # ==========================================
 def main():
-    """Entry point v3.12.0"""
     logger.info("=" * 50)
     logger.info(f"FitnessJournal Bot v{BOT_VERSION}")
     logger.info(f"{BOT_VERSION_DESC}")
@@ -1870,7 +1978,6 @@ def main():
     is_valid, integrity_msg = check_activities_integrity()
     if not is_valid:
         logger.warning(f"⚠️ INTEGRIDADE: {integrity_msg}")
-        logger.info("🔧 Será corrigido automaticamente no próximo load...")
     else:
         logger.info(f"✅ INTEGRIDADE: {integrity_msg}")
 
@@ -1880,12 +1987,21 @@ def main():
     all_activities = get_all_formatted_activities()
     logger.info(f"🏃 Atividades: {len(all_activities)}")
 
-    logger.info("🧹 Auto-cleanup...")
-    cleaned, _ = cleanup_old_flags()
+    logger.info("🧹 Auto-cleanup de flags penduradas (>24h)...")
+    cleaned, cleanup_msgs = cleanup_old_flags()
     if cleaned > 0:
-        logger.info(f"✅ {cleaned} flags limpos")
+        logger.info(f"✅ {cleaned} flags penduradas removidas no arranque")
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # v3.13.0: Regista tarefa de background para monitorização de flags
+    app.job_queue.run_repeating(
+        job_check_flags,
+        interval=JOB_QUEUE_INTERVAL_SECONDS,
+        first=JOB_QUEUE_INTERVAL_SECONDS,
+        name="flag_watcher"
+    )
+    logger.info(f"✅ JobQueue flag_watcher registado (intervalo: {JOB_QUEUE_INTERVAL_SECONDS}s)")
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
@@ -1911,11 +2027,12 @@ def main():
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
     logger.info(f"✅ Bot v{BOT_VERSION} iniciado")
-    logger.info(f"  - Separação estrita de contextos IA")
-    logger.info(f"  - Cabeçalho técnico em /analyze_activity")
-    logger.info(f"  - /status com dashboard biométrico antes do feeling")
-    logger.info(f"  - Fallback biométrico dia anterior")
-    logger.info(f"  - Logs JSON com contagem de itens")
+    logger.info(f"  - JobQueue async flag watcher ({JOB_QUEUE_INTERVAL_SECONDS}s)")
+    logger.info(f"  - Stale biometrics flag + aviso IA")
+    logger.info(f"  - Backup automático activities.json.bak")
+    logger.info(f"  - Cleanup flags penduradas >24h")
+    logger.info(f"  - HRV trend com setas ↑↓=")
+    logger.info(f"  - 150kg explícito em ciclismo com carga")
     logger.info(f"  - Timeout Gemini: {GEMINI_TIMEOUT_SECONDS}s")
     logger.info(f"  - Retry delays: {RETRY_DELAYS}")
     logger.info(f"  - Circuit breaker: {CIRCUIT_BREAKER_THRESHOLD} falhas threshold")
@@ -1923,7 +2040,6 @@ def main():
     logger.info(f"  - Rate limit: {RATE_LIMIT_MAX_REQUESTS} req/{RATE_LIMIT_WINDOW}s")
 
     print(f"🤖 Bot v{BOT_VERSION} ativo")
-
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == '__main__':
