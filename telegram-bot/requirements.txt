@@ -1,5 +1,6 @@
+python-telegram-bot[job-queue]==20.7
 python-telegram-bot==20.7
 garminconnect==0.1.55
-google-generativeai==0.8.3
+google-generativeai==0.8.4
 python-dotenv==1.0.0
 

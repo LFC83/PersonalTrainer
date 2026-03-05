@@ -27,6 +27,13 @@ logger = logging.getLogger(__name__)
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 logger.info("Gemini API configurada")
 
+try:
+    available_models = [m.name for m in genai.list_models()]
+    logger.info(f"🤖 Modelos disponíveis na sua conta: {available_models}")
+except Exception as e:
+    logger.error(f"❌ Erro ao listar modelos: {e}")
+
+
 # Bot Configuration
 BOT_VERSION = "3.15.1"
 BOT_VERSION_DESC = (
@@ -155,10 +162,20 @@ PROIBIDO incluir tabela de treino futuro ou sugestões de musculação/core nest
 - Usa "km/h" em vez de notação complexa
 """
 
+#os.environ["GOOGLE_API_USE_V2_GENERATIVE_LANGUAGE"] = "false"
+os.environ["GOOGLE_GENERATIVE_AI_API_VERSION"] = "v1"
+MODEL_NAME = "gemini-2.5-flash"
+GEMINI_FALLBACK_MODEL = "gemini-2.5-pro"
 model = genai.GenerativeModel(
-    model_name='gemini-3-flash-preview',
+    model_name=MODEL_NAME,
     system_instruction=SYSTEM_PROMPT
 )
+
+
+#model = genai.GenerativeModel(
+#    #model_name='gemini-3-flash-preview',
+#    system_instruction=SYSTEM_PROMPT
+#)
 
 # ==========================================
 # CUSTOM EXCEPTIONS
@@ -1123,7 +1140,8 @@ def clear_user_context(user_id: int):
 # ==========================================
 
 # v3.14.0: Modelo de fallback quando o modelo configurado retorna 429 (Quota Exceeded).
-GEMINI_FALLBACK_MODEL = "gemini-1.0-pro"
+#GEMINI_FALLBACK_MODEL = "gemini-1.0-pro"
+
 
 def _is_quota_error(exc: Exception) -> bool:
     """Detecta erros 429 (Quota Exceeded) do Gemini."""

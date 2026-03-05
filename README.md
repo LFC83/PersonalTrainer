@@ -125,6 +125,21 @@ EN: How do I clear pending requests?
 
 # Changelog
 
+## [3.15.2] - 2026-03-05
+### Adicionado
+- Log de diagnóstico no arranque para listar modelos disponíveis na API Key.
+- Forçado o uso da versão 'v1' da API do Google Generative AI via variável de ambiente.
+
+### Corrigido
+- Erro 404 (Not Found): Otimizada a nomenclatura dos modelos para `gemini-2.5-flash` e `gemini-2.5-pro`, conforme reportado pela infraestrutura da conta.
+- Erro 400 (Invalid Format): Removido o prefixo redundante `models/` nas constantes, permitindo que o SDK faça a gestão correta do endpoint.
+- Estabilidade da conexão ao mudar o transporte para REST em caso de falhas de gRPC.
+
+### Alterado
+- Modelo principal: `gemini-2.5-flash`
+- Modelo fallback: `gemini-2.5-pro`
+- Enriquecimento automático de atividades: Desativado permanentemente para preservação de quota.
+
 
 ## 🚀 Versão Atual: 3.15.0 (2026-03-03) - "Cycling Logic Restoration"
 
