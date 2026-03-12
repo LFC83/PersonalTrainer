@@ -120,10 +120,36 @@ EN: How do I clear pending requests?
 
     Use the /cleanup command to clear old flags and reorganize activity history.
     
+Erro de Autenticação Garmin (401 Unauthorized)
+Se mudares a password da conta Garmin:
+
+    Atualiza a variável GARMIN_PASSWORD no ficheiro .env.
+
+    Apaga a cache de sessão: "rm -rf data/.garth" (ou a pasta de tokens).
+
+    Reinicia: "docker compose up -d garmin-fetcher".
+
+Erro 404 / 400 no Gemini
+Se o modelo não for encontrado:
+
+    Verifica se a API Key no Google AI Studio está ativa.
+
+    Confirma nos logs se o ID "gemini-2.5-flash" ainda é o modelo listado para a tua conta.
+
+Desformatação no Telegram
+
+    O bot usa MarkdownV2 e separadores Unicode. Garante que o teu cliente Telegram está atualizado para renderizar as linhas de separação corretamente.
 
 ---
 
 # Changelog
+
+[v3.15.5] - 2026-03-12
+
+-  Mobile-First UI: Substituição total de tabelas Markdown por "Cards" verticais. Agora as respostas adaptam-se à largura do smartphone sem scroll horizontal.
+-  Gemini 2.5 Flash: Estabilização do motor de IA no modelo gemini-2.5-flash (API v1), eliminando falhas de comunicação.
+-  Prompt Dinâmica: O treinador agora conhece apenas os teus EQUIPAMENTOS_GIM reais, injetados dinamicamente no arranque.
+-  Protocolo de Verdade: Reforço da prioridade biométrica: Dados Objetivos (Garmin) sobrepõem-se à Sensação Subjetiva.
 
 ## [3.15.2] - 2026-03-05
 ### Adicionado
