@@ -35,9 +35,9 @@ except Exception as e:
 
 
 # Bot Configuration
-BOT_VERSION = "3.15.1"
+BOT_VERSION = "3.16.0"
 BOT_VERSION_DESC = (
-    "Change fallback model, disable auto enrichment"
+    "Corrida adicionada; fluxo Orox/carga no /status; fix HRV tendência; histórico atividades no prompt"
 )
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 DATA_DIR = '/data'
@@ -102,6 +102,18 @@ JOB_QUEUE_INTERVAL_SECONDS = 30
 JOB_QUEUE_WRITE_SETTLE_SECONDS = 2
 
 # ==========================================
+# ATLETE PROFILE (v3.15.8)
+# ==========================================
+PESO_ATLETA = 88.0  # kg
+ZONAS_FC = {
+    "Z1": "Recuperação (<124 bpm)",
+    "Z2": "Aeróbica (124-138 bpm)",
+    "Z3": "Tempo (138-152 bpm)",
+    "Z4": "Limiar (152-166 bpm)",
+    "Z5": "Anaeróbica (>166 bpm)"
+}
+
+# ==========================================
 # SYSTEM PROMPT (v3.15.5 - Full Mobile Optimization)
 # ==========================================
 SYSTEM_PROMPT = f"""
@@ -116,9 +128,20 @@ Operas sob o PROTOCOLO DE VERDADE. A tua diretiva primária é precisão analít
 - Usa "km/h" e "W/kg".
 
 ### POSTURA DE TREINADOR DE ELITE:
-- Especialista em Ciclismo (MTB/Estrada) e Hipertrofia. Assertivo, direto e sem rodeios.
+- Especialista em Ciclismo (MTB/Estrada), Corrida de Estrada, e Hipertrofia. Assertivo, direto e sem rodeios.
 - SEM EMOJIS decorativos (usa apenas os símbolos estruturais indicados abaixo).
 - Se o atleta falhou ou fez escolhas subótimas, aponta o erro sem suavizar.
+
+### PERFIL DO ATLETA (DADOS REAIS):
+- PESO ATUAL: {PESO_ATLETA} kg (Usa este valor para todos os cálculos de W/kg).
+- ZONAS DE FC: {ZONAS_FC} (Usa estas balizas para a análise de deriva cardíaca).
+
+### LÓGICA DE EQUIPAMENTO (HEURÍSTICA):
+Identifica a bicicleta automaticamente pelo tipo de atividade:
+1. **TERN OROX (Pneus 4"):** Assume esta para todas as atividades de "Ciclismo Urbano", "Commute", "MTB" ou se houver menção a "CARGA".
+   - Nota: Resistência ao rolamento massiva. Foca na análise de torque e RPE.
+2. **VAN RYSEL (Slicks):** Assume esta exclusivamente para atividades de "Ciclismo de Estrada".
+   - Nota: Alta eficiência. Espera cadências fluidas (85-95 rpm) e maior velocidade/watt.
 
 ### HIERARQUIA DE DECISÃO BIOMÉTRICA (REGRA DE OURO):
 Dá prioridade aos DADOS OBJETIVOS sobre a SENSAÇÃO SUBJETIVA.
@@ -1012,6 +1035,37 @@ def get_all_formatted_activities() -> List['FormattedActivity']:
     formatted.sort(key=lambda x: x.date or '0000-00-00', reverse=True)
     return formatted
 
+
+def get_activity_history_for_prompt(n: int = 3) -> str:
+    """
+    v3.16.0: Retorna as últimas N atividades do activities.json como string
+    resumida (Data, Tipo, Esforço) para injeção no prompt do Gemini.
+    Fornece contexto histórico de fadiga acumulada ao modelo.
+    """
+    activities = get_all_formatted_activities()
+    if not activities:
+        return "Sem atividades registadas."
+
+    lines = []
+    for act in activities[:n]:
+        date_str = act.date or "N/A"
+        sport_str = act.sport or "Desconhecido"
+        effort_parts = []
+        if act.duration_min:
+            effort_parts.append(f"{act.duration_min:.0f}min")
+        if act.distance_km:
+            effort_parts.append(f"{act.distance_km:.1f}km")
+        if act.avg_hr:
+            effort_parts.append(f"FC {act.avg_hr}bpm")
+        if act.load:
+            effort_parts.append(f"Carga {act.load:.0f}")
+        elif act.calories:
+            effort_parts.append(f"{act.calories}kcal")
+        effort_str = " | ".join(effort_parts) if effort_parts else "sem métricas"
+        lines.append(f"- {date_str} | {sport_str} | {effort_str}")
+
+    return "\n".join(lines)
+
 # ==========================================
 # DATA INTEGRITY
 # ==========================================
@@ -1069,17 +1123,15 @@ def reorganize_activities() -> Tuple[int, int, List[str]]:
 #    if not activities:
 #        logger.debug("Sem atividades para enriquecer")
 #        return
-
-    enriched_count = 0
-    for activity_id, data in activities.items():
-        if '_enriched' not in data:
-            data['_enriched'] = True
-            data['_enriched_at'] = datetime.now().isoformat()
-            enriched_count += 1
-
-    if enriched_count > 0:
-        save_activities_index(activities)
-        logger.info(f"✅ {enriched_count} atividades enriquecidas")
+#    enriched_count = 0
+#    for activity_id, data in activities.items():
+#        if '_enriched' not in data:
+#            data['_enriched'] = True
+#            data['_enriched_at'] = datetime.now().isoformat()
+#            enriched_count += 1
+#    if enriched_count > 0:
+#        save_activities_index(activities)
+#        logger.info(f"✅ {enriched_count} atividades enriquecidas")
 
 # ==========================================
 # CONTEXT MANAGEMENT
@@ -1367,8 +1419,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if today_bio.rhr:
                 bio_lines.append(f"  RHR: {today_bio.rhr}bpm")
             if today_bio.hrv is not None and 'hrv_avg' in baseline:
-                pct = ((today_bio.hrv - baseline['hrv_avg']) / baseline['hrv_avg']) * 100
-                bio_lines.append(f"  HRV: {today_bio.hrv:.0f} ({pct:+.0f}% vs média)")
+                hrv_media_7d = baseline['hrv_avg']
+                bio_lines.append(f"  HRV: Tendência: {today_bio.hrv:.0f} (Média 7d: {hrv_media_7d:.0f}) ms")
             elif today_bio.hrv is not None:
                 bio_lines.append(f"  HRV: {today_bio.hrv:.0f}")
             if today_bio.sleep is not None:
@@ -1412,13 +1464,70 @@ async def process_status_with_feeling(update: Update, context: ContextTypes.DEFA
     """
     v3.12.0: Processa /status após receber o feeling.
     v3.14.0: Lê is_stale de context.user_data e injeta aviso no prompt se verdadeiro.
+    v3.16.0: Guarda feeling e pergunta sobre Orox antes de chamar Gemini.
     """
     user_id = update.effective_user.id
+
+    try:
+        # Guarda o feeling para uso posterior após resposta Orox
+        context.user_data['pending_feeling'] = feeling
+        session_state.set_user_state(user_id, 'waiting_orox')
+
+        keyboard = [
+            [InlineKeyboardButton("Sim, com carga", callback_data="orox_yes")],
+            [InlineKeyboardButton("Não", callback_data="orox_no")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            "🚲 Vais fazer alguma deslocação de 20km na Orox com passageiro hoje?",
+            reply_markup=reply_markup
+        )
+
+    except Exception as e:
+        logger.error(f"Erro em process_status_with_feeling: {e}\n{traceback.format_exc()}")
+        session_state.clear_user_state(user_id)
+        await update.message.reply_text(f"❌ Erro: {str(e)[:100]}")
+
+
+async def orox_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    v3.16.0: Callback para a pergunta Orox/carga no fluxo /status.
+    Lê o feeling guardado e chama process_status_final com ambos os dados.
+    """
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    try:
+        has_orox = query.data == "orox_yes"
+        feeling = context.user_data.get('pending_feeling')
+
+        if feeling is None:
+            await query.edit_message_text("❌ Sessão expirada. Usa /status novamente.")
+            session_state.clear_user_state(user_id)
+            return
+
+        await query.edit_message_text(
+            "✅ Contexto registado. A avaliar prontidão biológica..."
+        )
+        await process_status_final(query, context, feeling, has_orox)
+
+    except Exception as e:
+        logger.error(f"Erro em orox_callback: {e}\n{traceback.format_exc()}")
+        session_state.clear_user_state(user_id)
+        await query.message.reply_text(f"❌ Erro: {str(e)[:100]}")
+
+
+async def process_status_final(query, context: ContextTypes.DEFAULT_TYPE, feeling: int, has_orox: bool):
+    """
+    v3.16.0: Chamada final ao Gemini para /status, após ter feeling e resposta Orox.
+    Injeta contexto de carga extra se has_orox=True.
+    Inclui histórico resumido das últimas 3 atividades para contexto de fadiga.
+    """
+    user_id = query.from_user.id
     is_stale = context.user_data.get('biometrics_is_stale', False)
 
     try:
-        await update.message.reply_text("🔍 A avaliar prontidão biológica...")
-
         history = get_recent_biometrics(7)
         baseline = calculate_biometric_baseline(history)
         bio_context = format_biometric_context(history, baseline)
@@ -1426,7 +1535,7 @@ async def process_status_with_feeling(update: Update, context: ContextTypes.DEFA
         activities = get_all_formatted_activities()
 
         if not activities:
-            await update.message.reply_text(
+            await query.message.reply_text(
                 "📭 Sem atividades.\n\nUsa /sync ou /import primeiro."
             )
             session_state.clear_user_state(user_id)
@@ -1443,11 +1552,24 @@ async def process_status_with_feeling(update: Update, context: ContextTypes.DEFA
             if is_stale else ""
         )
 
+        # v3.16.0: Contexto de carga extra Orox
+        orox_context = (
+            "\n[CONTEXTO ADICIONAL: O atleta terá uma carga extra de 20km em bicicleta de carga com passageiro após o treino principal]\n"
+            if has_orox else ""
+        )
+
+        # v3.16.0: Histórico resumido das últimas 3 atividades para contexto de fadiga
+        activity_history_str = get_activity_history_for_prompt(n=3)
+
         prompt = f"""
 {bio_context}
 {stale_warning}
 ### SENSAÇÃO SUBJETIVA DO ATLETA:
 Feeling de hoje: {feeling}/10
+
+{orox_context}
+### HISTÓRICO DE ATIVIDADES RECENTES (contexto de fadiga acumulada):
+{activity_history_str}
 
 ### ATIVIDADES RECENTES (Últimas {len(recent)}):
 
@@ -1468,23 +1590,25 @@ OBRIGATÓRIO:
 3. Tabela de Treino usando APENAS o equipamento listado acima
 4. Se o atleta é ciclista, sugere apenas reforço core/postural ou endurance — NUNCA máquinas de ginásio comercial
 5. Se HRV/RHR indicarem fadiga mas o feeling for alto (>7), ALERTA para fadiga mascarada
+{"6. Considera a carga extra de 20km Orox com passageiro na prescrição de intensidade e volume" if has_orox else ""}
 Usa o formato de tabela obrigatório do sistema.
 """
 
         response_text = await call_gemini_with_retry(prompt, user_id)
-        await send_long_message(update.message, response_text)
+        await send_long_message(query.message, response_text)
         add_to_context_history(user_id, 'status', prompt, response_text)
         session_state.clear_user_state(user_id)
 
     except GeminiTimeoutError:
-        await update.message.reply_text(f"⏱️ Timeout após {GEMINI_TIMEOUT_SECONDS}s. Tenta novamente.")
+        await query.message.reply_text(f"⏱️ Timeout após {GEMINI_TIMEOUT_SECONDS}s. Tenta novamente.")
     except CircuitBreakerOpen:
-        await update.message.reply_text("⚠️ Serviço temporariamente indisponível. Aguarda 1 minuto.")
+        await query.message.reply_text("⚠️ Serviço temporariamente indisponível. Aguarda 1 minuto.")
     except RateLimitExceeded:
-        await update.message.reply_text("⚠️ Rate limit excedido. Aguarda 1 minuto.")
+        await query.message.reply_text("⚠️ Rate limit excedido. Aguarda 1 minuto.")
     except Exception as e:
-        logger.error(f"Erro em process_status_with_feeling: {e}\n{traceback.format_exc()}")
-        await update.message.reply_text(f"❌ Erro: {str(e)[:100]}")
+        logger.error(f"Erro em process_status_final: {e}\n{traceback.format_exc()}")
+        session_state.clear_user_state(user_id)
+        await query.message.reply_text(f"❌ Erro: {str(e)[:100]}")
 
 async def activities_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -1594,6 +1718,7 @@ async def analyze_activity_callback(update: Update, context: ContextTypes.DEFAUL
         activity = activities[index]
         sport_lower = activity.sport.lower()
         is_cycling = any(x in sport_lower for x in ['cicl', 'mtb', 'spin', 'bike', 'cycling', 'road_biking'])
+        is_running = any(x in sport_lower for x in ['run', 'corrida', 'trail', 'running'])
 
         if is_cycling:
             # v3.15.0: Sempre apresenta o seletor de tipo para QUALQUER atividade de ciclismo.
@@ -1602,13 +1727,17 @@ async def analyze_activity_callback(update: Update, context: ContextTypes.DEFAUL
                 [InlineKeyboardButton("🚵 MTB", callback_data=f"cycle_type_mtb_{index}")],
                 [InlineKeyboardButton("🚴 Estrada", callback_data=f"cycle_type_estrada_{index}")],
                 [InlineKeyboardButton("🏋️ Spinning", callback_data=f"cycle_type_spinning_{index}")],
-                [InlineKeyboardButton("🚲 Cidade", callback_data=f"cycle_type_cidade_{index}")]
+                [InlineKeyboardButton("🚲 Cidade", callback_data=f"cycle_type_cidade_{index}")],
+                [InlineKeyboardButton("🦺 Corrida (Orox)", callback_data=f"cycle_type_corrida_{index}")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(
                 f"🚴 Atividade: {activity.to_brief_summary()}\n\nQue tipo de ciclismo foi?",
                 reply_markup=reply_markup
             )
+        elif is_running:
+            # v3.16.0: Corrida — pergunta diretamente sobre carga Orox (sem seletor de tipo ciclismo)
+            await ask_about_cargo(query, activity, index, cycling_type="corrida")
         else:
             await perform_activity_analysis(query, activity, has_cargo=False, cycling_type=None)
 
@@ -1741,6 +1870,14 @@ async def perform_activity_analysis(query, activity: 'FormattedActivity', has_ca
                     "\nREGRA CIDADE: Ciclismo urbano com arranques e paragens frequentes. "
                     "Considera baixa eficiência metabólica por dinâmica stop-and-go. "
                     "Foca em volume total e calorias. Não uses cadência como métrica primária.\n"
+                )
+            elif ct == "corrida":
+                cycling_type_instruction = (
+                    "\nREGRA CORRIDA: Atividade de corrida de estrada ou trail. "
+                    "Foca na análise de FC por zonas, cadência de passada (ótimo: 170-180 spm), "
+                    "e impacto músculo-esquelético (especialmente em trail com desnível). "
+                    "Avalia tempo de contacto com o solo como indicador de fadiga. "
+                    "Não apliques métricas de ciclismo (RPM, potência watt) neste contexto.\n"
                 )
 
         prompt = f"""
@@ -1983,12 +2120,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/debug - Informações de debug\n"
         "/health - Health check do sistema\n"
         "/help - Esta ajuda\n\n"
-        "🆕 v3.15.0:\n"
-        "• Seletor de tipo de ciclismo restaurado para TODAS as atividades de ciclismo\n"
-        "• Regras de análise específicas por tipo: MTB, Estrada, Spinning, Cidade\n"
-        "• MTB: valoriza esforço técnico e cardiovascular em terreno irregular\n"
-        "• Estrada: foca em cadência constante e eficiência aerodinâmica\n"
-        "• Mantidas todas as melhorias de sincronização e segurança da v3.14\n"
+        "🆕 v3.16.0:\n"
+        "• Corrida adicionada como tipo de treino (análise de passada, FC e trail)\n"
+        "• Fluxo /status: pergunta Orox/carga após feeling antes de chamar IA\n"
+        "• Fix HRV /status: mostra valor de hoje + média 7d em ms\n"
+        "• Histórico últimas 3 atividades injetado no prompt para contexto de fadiga\n"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2014,6 +2150,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except ValueError:
                 await update.message.reply_text("❌ Por favor, responde com um número entre 0 e 10.")
                 return
+
+        if user_state == 'waiting_orox':
+            await update.message.reply_text(
+                "⬆️ Usa os botões acima para responder à pergunta sobre a Orox."
+            )
+            return
 
         context_data = load_context_from_disk(user_id)
 
@@ -2128,15 +2270,20 @@ def main():
 
     app.add_handler(CallbackQueryHandler(sync_confirmed_callback, pattern=r'^sync_confirmed$'))
     app.add_handler(CallbackQueryHandler(analyze_activity_callback, pattern=r'^analyze_act_\d+$'))
-    app.add_handler(CallbackQueryHandler(cycling_type_callback, pattern=r'^cycle_type_(mtb|estrada|spinning|cidade)_\d+$'))
+    app.add_handler(CallbackQueryHandler(cycling_type_callback, pattern=r'^cycle_type_(mtb|estrada|spinning|cidade|corrida)_\d+$'))
     app.add_handler(CallbackQueryHandler(cargo_callback, pattern=r'^cargo_(yes|no)_\d+'))
+    app.add_handler(CallbackQueryHandler(orox_callback, pattern=r'^orox_(yes|no)$'))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
     logger.info(f"✅ Bot v{BOT_VERSION} iniciado")
+    logger.info(f"  - Corrida adicionada como tipo de treino")
+    logger.info(f"  - Fluxo /status: feeling → pergunta Orox → Gemini")
+    logger.info(f"  - Fix HRV tendência: valor hoje + média 7d ms")
+    logger.info(f"  - Histórico 3 atividades injetado no prompt /status")
     logger.info(f"  - Seletor de tipo ciclismo para todas as atividades cycling")
-    logger.info(f"  - Regras AI: MTB/Estrada/Spinning/Cidade injetadas no prompt")
+    logger.info(f"  - Regras AI: MTB/Estrada/Spinning/Cidade/Corrida injetadas no prompt")
     logger.info(f"  - JobQueue async flag watcher ({JOB_QUEUE_INTERVAL_SECONDS}s)")
     logger.info(f"  - Stale biometrics flag + aviso IA")
     logger.info(f"  - Backup automático activities.json.bak")

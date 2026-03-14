@@ -93,6 +93,13 @@ services:
 | `/cleanup` | Limpa flags pendentes e organiza JSONs | v2.5 |
 ```
 
+####4. Equipamento e configurações do atleta
+
+Atributo	Valor Configurado
+Peso Base	88.0 kg
+Zonas FC	Z1 (<130) a Z5 (>175)
+Bikes	Tern Orox (4") & Van Rysel (Slick)
+Modalidades	Ciclismo, Ginásio, Corrida
     
 ### ❓ FAQ (Perguntas Frequentes)
 
@@ -143,6 +150,28 @@ Desformatação no Telegram
 ---
 
 # Changelog
+
+[v3.16] - 2026-03-14
+
+🚀 Novas Funcionalidades
+
+    Apoio Multi-modalidade (Corrida): Adicionada a modalidade Corrida (Running) ao seletor de treino e ao motor de inteligência. O bot agora analisa ritmos (min/km) e impacto articular.
+
+    Fluxo de Decisão Contextual (Carga Orox): Introdução de uma pergunta interativa após a seleção do treino: "Vais fazer uma deslocação de 20km na Orox com passageiro hoje?".
+
+        A IA ajusta o volume de pernas e a intensidade do treino caso haja carga extra prevista.
+
+    Memória de Curto Prazo (Histórico): O comando /status agora injeta automaticamente o histórico das últimas 3 atividades no contexto da IA, permitindo uma análise de fadiga acumulada muito mais precisa.
+
+🛠️ Correções e Melhorias Técnicas
+
+    Perfil de Atleta Estático: Reintegração das constantes de Peso (85kg) e Zonas de Ritmo Cardíaco no System Prompt para cálculos exatos de W/kg e deriva cardíaca.
+
+    Correção Visual (HRV): Corrigido o bug na linha de tendência do HRV que repetia o valor de hoje. Agora exibe: Hoje (Média 7d).
+
+    Heurística de Equipamento: Refinamento da lógica que diferencia automaticamente o uso da Tern Orox (Cidade/MTB/Carga) vs. Van Rysel (Estrada).
+
+    Estabilidade Gemini: Otimização do System Prompt para o modelo 2.5 Flash, garantindo respostas rápidas e seguindo o formato de "Cards" para leitura em telemóvel.
 
 [v3.15.5] - 2026-03-12
 
